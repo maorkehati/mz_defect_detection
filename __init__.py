@@ -9,8 +9,8 @@ from .config import (
     PreprocessingConfig,
     ThresholdingConfig,
 )
+from .dd_types import DetectionResult, PipelineArtifacts, SamplePair
 from .pipeline import DefectDetectionPipeline
-from .types import DetectionResult, PipelineArtifacts, SamplePair
 
 __all__ = [
     "AlignmentConfig",

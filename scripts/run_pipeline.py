@@ -15,10 +15,10 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from defect_detection.config import build_default_config
-from defect_detection.data import load_sample_pairs
-from defect_detection.pipeline import DefectDetectionPipeline
-from defect_detection.visualization import (
+from config import build_default_config
+from data import load_sample_pairs
+from pipeline import DefectDetectionPipeline
+from visualization import (
     plot_detection_result,
     save_anomaly_map,
     save_binary_mask,

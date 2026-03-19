@@ -1,3 +1,7 @@
+outs/
+__pycache__/
+*.pyc
+
 # Outputs
 outs/
 
