@@ -88,7 +88,7 @@ def plot_prediction_panels(
     binary_mask_raw: np.ndarray | None = None,
     figsize: tuple[float, float] = (14, 10),
     suptitle: str | None = None,
-    show: bool = True,
+    show: bool = False,
 ) -> "plt.Figure":
     """
     Plot core prediction and debugging panels.
@@ -122,8 +122,6 @@ def plot_prediction_panels(
     if suptitle:
         fig.suptitle(suptitle)
     fig.tight_layout()
-    if show:
-        plt.show()
     return fig
 
 
@@ -131,7 +129,7 @@ def plot_detection_result(
     result: DetectionResult,
     figsize: tuple[float, float] = (14, 10),
     suptitle: str | None = None,
-    show: bool = True,
+    show: bool = False,
 ) -> "plt.Figure":
     """
     Plot standard panels from a DetectionResult.
@@ -159,8 +157,5 @@ def plot_detection_result(
     overlay_ax = fig.add_axes([0.72, 0.02, 0.25, 0.25])
     _show_mask_overlay(overlay_ax, inspected=inspected, mask=binary_final)
 
-    if show:
-        plt = _get_plt()
-        plt.show()
     return fig
 

@@ -17,6 +17,10 @@ class SamplePair:
 
 @dataclass
 class PipelineArtifacts:
+    reference_raw: Optional[Array] = None
+    inspected_raw: Optional[Array] = None
+
+    # Backward-compatible aliases used by existing visualization code.
     reference_input: Optional[Array] = None
     inspected_input: Optional[Array] = None
 
@@ -25,14 +29,19 @@ class PipelineArtifacts:
 
     reference_aligned: Optional[Array] = None
     inspected_aligned: Optional[Array] = None
+    valid_mask: Optional[Array] = None
     alignment_metadata: Optional[Dict[str, Any]] = None
 
     reference_normalized: Optional[Array] = None
     inspected_normalized: Optional[Array] = None
     normalization_metadata: Optional[Dict[str, Any]] = None
+    normalization_debug: Dict[str, Any] = field(default_factory=dict)
 
     anomaly_map: Optional[Array] = None
+    ssim_map: Optional[Array] = None
+    comparison_metadata: Dict[str, Any] = field(default_factory=dict)
     threshold_map: Optional[Array] = None
+    thresholding_metadata: Dict[str, Any] = field(default_factory=dict)
     binary_mask_raw: Optional[Array] = None
     binary_mask_final: Optional[Array] = None
 

@@ -80,7 +80,7 @@ class ComparatorBase(BaseModule[ComparisonConfig], ABC):
         reference_image: Array,
         inspected_image: Array,
         cfg: ComparisonConfig,
-    ) -> Array:
+    ) -> Any:
         raise NotImplementedError
 
 
@@ -90,7 +90,7 @@ class ThresholdingBase(BaseModule[ThresholdingConfig], ABC):
         self,
         anomaly_map: Array,
         cfg: ThresholdingConfig,
-    ) -> Tuple[Array, Array]:
+    ) -> Any:
         raise NotImplementedError
 
 

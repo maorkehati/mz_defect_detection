@@ -113,20 +113,135 @@ def build_default_config() -> PipelineConfig:
 
 # Registry dictionaries used by `factories.py`.
 #
-# These map config choice strings to concrete module classes.
-from modules.alignment import TranslationPhaseCorrelationAligner
-from modules.comparison import AbsoluteDifferenceComparator
-from modules.normalization import LinearGainOffsetNormalizer
-from modules.postprocessing import BasicMorphologyPostprocessor
-from modules.preprocessing import GaussianPreprocessor
-from modules.thresholding import MadThresholding
+# Entries are lazy constructors so optional dependencies only load
+# when a specific method is selected.
+def _build_gaussian_preprocess():
+    from modules.preprocessing.gaussian_preprocess import GaussianPreprocessor
 
-PREPROCESSOR_REGISTRY = {"gaussian_preprocess": GaussianPreprocessor}
-ALIGNER_REGISTRY = {"translation_phase_correlation": TranslationPhaseCorrelationAligner}
-NORMALIZER_REGISTRY = {"linear_gain_offset": LinearGainOffsetNormalizer}
-COMPARATOR_REGISTRY = {"absolute_difference": AbsoluteDifferenceComparator}
-THRESHOLDING_REGISTRY = {"mad_threshold": MadThresholding}
-POSTPROCESSOR_REGISTRY = {"basic_morphology": BasicMorphologyPostprocessor}
+    return GaussianPreprocessor()
+
+
+def _build_translation_phase_correlation():
+    from modules.alignment.translation_phase_correlation import TranslationPhaseCorrelationAligner
+
+    return TranslationPhaseCorrelationAligner()
+
+
+def _build_orb_affine():
+    from modules.alignment.orb_affine import OrbAffineAligner
+
+    return OrbAffineAligner()
+
+
+def _build_ecc_translation():
+    from modules.alignment.ecc_alignment import EccTranslationAligner
+
+    return EccTranslationAligner()
+
+
+def _build_ecc_euclidean():
+    from modules.alignment.ecc_alignment import EccEuclideanAligner
+
+    return EccEuclideanAligner()
+
+
+def _build_ecc_affine():
+    from modules.alignment.ecc_alignment import EccAffineAligner
+
+    return EccAffineAligner()
+
+
+def _build_ecc_affine_projected_euclidean():
+    from modules.alignment.ecc_alignment import EccAffineProjectedEuclideanAligner
+
+    return EccAffineProjectedEuclideanAligner()
+
+
+def _build_search_euclidean():
+    from modules.alignment.search_euclidean import SearchEuclideanAligner
+
+    return SearchEuclideanAligner()
+
+
+def _build_linear_gain_offset():
+    from modules.normalization.linear_gain_offset import LinearGainOffsetNormalizer
+
+    return LinearGainOffsetNormalizer()
+
+
+def _build_absolute_difference():
+    from modules.comparison.absolute_difference import AbsoluteDifferenceComparator
+
+    return AbsoluteDifferenceComparator()
+
+
+def _build_ssim_comparator():
+    from modules.comparison.ssim_comparator import SsimComparator
+
+    return SsimComparator()
+
+
+def _build_gradient_difference():
+    from modules.comparison.gradient_difference import GradientDifferenceComparator
+
+    return GradientDifferenceComparator()
+
+
+def _build_mad_threshold():
+    from modules.thresholding.mad_threshold import MadThresholding
+
+    return MadThresholding()
+
+
+def _build_otsu_threshold():
+    from modules.thresholding.otsu_threshold import OtsuThresholding
+
+    return OtsuThresholding()
+
+
+def _build_fixed_threshold():
+    from modules.thresholding.fixed_threshold import FixedThresholding
+
+    return FixedThresholding()
+
+
+def _build_basic_morphology():
+    from modules.postprocessing.basic_morphology import BasicMorphologyPostprocessor
+
+    return BasicMorphologyPostprocessor()
+
+
+def _build_contour_filter_postprocess():
+    from modules.postprocessing.contour_filter_postprocess import ContourFilterPostprocessor
+
+    return ContourFilterPostprocessor()
+
+
+PREPROCESSOR_REGISTRY = {"gaussian_preprocess": _build_gaussian_preprocess}
+ALIGNER_REGISTRY = {
+    "translation_phase_correlation": _build_translation_phase_correlation,
+    "orb_affine": _build_orb_affine,
+    "ecc_translation": _build_ecc_translation,
+    "ecc_euclidean": _build_ecc_euclidean,
+    "ecc_affine": _build_ecc_affine,
+    "ecc_affine_projected_euclidean": _build_ecc_affine_projected_euclidean,
+    "search_euclidean": _build_search_euclidean,
+}
+NORMALIZER_REGISTRY = {"linear_gain_offset": _build_linear_gain_offset}
+COMPARATOR_REGISTRY = {
+    "absolute_difference": _build_absolute_difference,
+    "ssim_comparator": _build_ssim_comparator,
+    "gradient_difference": _build_gradient_difference,
+}
+THRESHOLDING_REGISTRY = {
+    "mad_threshold": _build_mad_threshold,
+    "otsu_threshold": _build_otsu_threshold,
+    "fixed_threshold": _build_fixed_threshold,
+}
+POSTPROCESSOR_REGISTRY = {
+    "basic_morphology": _build_basic_morphology,
+    "contour_filter_postprocess": _build_contour_filter_postprocess,
+}
 
 __all__ = [
     "PREPROCESSOR_REGISTRY",
