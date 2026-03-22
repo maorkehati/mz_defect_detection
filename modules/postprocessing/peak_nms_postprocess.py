@@ -11,7 +11,12 @@ Primary input is the **normalized anomaly map** ``A`` in approximately ``[0, 1]`
 
 Selection policy: score each candidate, **accept** those with ``final_score >= accept_score_threshold``,
 then **greedy score NMS** (``post_accept_nms_radius_px``) to drop duplicates; optional **max_kept_peaks**
-guardrail only. ``top_k_keep`` is deprecated and ignored.
+guardrail only. The **final binary mask** unions **connected components** of ``binary_mask_raw`` (MAD
+threshold support) per kept peak (nearest foreground within ``threshold_component_seed_radius_px`` if
+needed), with fixed-radius **disk** fallback when no foreground exists nearby. Optionally
+(``refine_component_support``), each seed is **locally expanded** on the continuous anomaly map via
+hysteresis-style growth (``refine_mode=hysteresis_local``) inside an ROI so truncated defect support is
+recovered without new detections. ``top_k_keep`` is deprecated and ignored.
 
 See ``PeakNMSPostprocessConfig`` in ``config.py`` for typed defaults; ``case_overrides`` allows
 per-case tuning (case1/case2/case3 keys). Optional ``use_stat_derived_accept_threshold`` replaces
@@ -185,6 +190,248 @@ def _extract_peaks_opencv_fallback(
     order = np.argsort(-vals)
     coords = coords[order[: int(max_peaks)]]
     return coords.astype(np.int32)
+
+
+def _nearest_foreground_in_ball(
+    thr: np.ndarray,
+    x: int,
+    y: int,
+    max_r: int,
+) -> Optional[Tuple[int, int]]:
+    """Return integer (x, y) of nearest True pixel within Chebyshev ball max_r (inclusive), else None."""
+    h, w = thr.shape[:2]
+    thr_b = np.asarray(thr, dtype=bool)
+    if max_r <= 0:
+        if 0 <= y < h and 0 <= x < w and thr_b[y, x]:
+            return (x, y)
+        return None
+    best: Optional[Tuple[int, int]] = None
+    best_d2: Optional[float] = None
+    r = int(max(0, max_r))
+    r2 = float(r * r)
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if float(dx * dx + dy * dy) > r2 + 1e-9:
+                continue
+            xx, yy = x + dx, y + dy
+            if 0 <= yy < h and 0 <= xx < w and thr_b[yy, xx]:
+                d2 = float(dx * dx + dy * dy)
+                if best_d2 is None or d2 < best_d2:
+                    best_d2 = d2
+                    best = (xx, yy)
+    return best
+
+
+def _refine_seed_hysteresis_local(
+    seed: np.ndarray,
+    A: np.ndarray,
+    *,
+    margin_px: int,
+    max_fraction: float,
+    mean_factor: Optional[float],
+    min_grow_t: float,
+    morph_k: int,
+    morph_iter: int,
+) -> np.ndarray:
+    """
+    Expand a binary seed using the continuous anomaly map: hysteresis-style flood on a relaxed cutoff,
+    restricted to the union of connected components of ``growable`` that intersect the seed.
+
+    ``growable = (A >= t_grow) | seed`` so the strict seed is never stripped before connectivity.
+    """
+    h, w = A.shape[:2]
+    seed = np.asarray(seed, dtype=bool)
+    Af = np.asarray(A, dtype=np.float32)
+    if not np.any(seed):
+        return np.zeros((h, w), dtype=np.uint8)
+
+    ys, xs = np.where(seed)
+    m = int(max(0, margin_px))
+    x0 = max(0, int(xs.min()) - m)
+    x1 = min(w, int(xs.max()) + m + 1)
+    y0 = max(0, int(ys.min()) - m)
+    y1 = min(h, int(ys.max()) + m + 1)
+
+    roi_A = Af[y0:y1, x0:x1]
+    roi_seed = seed[y0:y1, x0:x1]
+    vals = roi_A[roi_seed]
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return (seed.astype(np.uint8) * 255)
+
+    a_max = float(np.max(vals))
+    a_mean = float(np.mean(vals))
+    if mean_factor is not None:
+        grow_t = max(float(min_grow_t), a_mean * float(mean_factor))
+    else:
+        grow_t = max(float(min_grow_t), a_max * float(max_fraction))
+
+    finite = np.isfinite(roi_A)
+    growable = ((roi_A >= grow_t) | roi_seed) & finite
+    grow_u8 = growable.astype(np.uint8) * 255
+    num_lbl, lbl = cv2.connectedComponents(grow_u8, connectivity=8)
+    if num_lbl <= 1:
+        out_roi = roi_seed
+    else:
+        ids = np.unique(lbl[roi_seed])
+        out_roi = np.zeros_like(roi_seed, dtype=bool)
+        for lid in ids:
+            if int(lid) == 0:
+                continue
+            out_roi |= lbl == int(lid)
+
+    refined = np.zeros((h, w), dtype=np.uint8)
+    refined[y0:y1, x0:x1] = out_roi.astype(np.uint8) * 255
+
+    mk = int(morph_k)
+    if mk >= 3 and int(morph_iter) > 0:
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (mk if mk % 2 == 1 else mk + 1, mk if mk % 2 == 1 else mk + 1))
+        refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, ker, iterations=int(morph_iter))
+
+    if not np.any(refined > 0):
+        return (seed.astype(np.uint8) * 255)
+    return refined
+
+
+def _peak_refine_options_from_params(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not bool(_cfg_get(p, "refine_component_support", True)):
+        return None
+    mode = str(_cfg_get(p, "refine_mode", "hysteresis_local")).lower().strip()
+    if mode == "none":
+        return None
+    return {
+        "mode": mode,
+        "margin_px": int(_cfg_get(p, "refine_roi_margin_px", 8)),
+        "max_fraction": float(_cfg_get(p, "refine_growth_component_max_fraction", 0.45)),
+        "mean_factor": _cfg_get(p, "refine_growth_component_mean_factor", None),
+        "min_grow_t": float(_cfg_get(p, "refine_min_growth_threshold", 0.0)),
+        "morph_k": int(_cfg_get(p, "refine_morph_close_kernel", 0)),
+        "morph_iter": int(_cfg_get(p, "refine_morph_close_iterations", 0)),
+    }
+
+
+def _prepare_threshold_support_for_components(
+    thr_bool: np.ndarray,
+    morph_kernel_px: int,
+) -> np.ndarray:
+    """Returns uint8 0/255 foreground mask for connected-components labeling."""
+    fg = np.asarray(thr_bool, dtype=np.uint8)
+    if fg.size == 0:
+        return fg
+    fg = (fg > 0).astype(np.uint8) * 255
+    mk = int(morph_kernel_px)
+    if mk >= 3:
+        k = mk if mk % 2 == 1 else mk + 1
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, ker)
+    return fg
+
+
+def _build_final_mask_from_threshold_components(
+    thr_bool: np.ndarray,
+    finalists: List[Dict[str, Any]],
+    *,
+    h: int,
+    w: int,
+    render_r: int,
+    seed_search_r: int,
+    morph_kernel_px: int,
+    anomaly_map: Optional[np.ndarray] = None,
+    refine: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    """
+    Union of connected components from the MAD threshold mask (``binary_mask_raw``) for each kept peak.
+
+    If the peak center is not on-mask, search within ``seed_search_r`` for the nearest foreground pixel
+    and use that component. If no foreground exists nearby, fall back to a fixed-radius disk (legacy).
+
+    Optional ``refine`` + ``anomaly_map``: hysteresis-style local growth from each seed (see
+    :func:`_refine_seed_hysteresis_local`).
+    """
+    out = np.zeros((h, w), dtype=np.uint8)
+    peaks: List[Dict[str, Any]] = []
+
+    thr_prep = _prepare_threshold_support_for_components(thr_bool, morph_kernel_px)
+    if not np.any(thr_prep > 0):
+        num_labels = 1
+        labels = np.zeros((h, w), dtype=np.int32)
+    else:
+        num_labels, labels = cv2.connectedComponents(thr_prep, connectivity=8)
+
+    for rank, fin in enumerate(finalists, start=1):
+        x, y = int(fin["x"]), int(fin["y"])
+        fs = float(fin["final_score"])
+        seed = _nearest_foreground_in_ball(thr_prep > 0, x, y, seed_search_r)
+        comp_mask: Optional[np.ndarray] = None
+        if seed is not None and num_labels > 1:
+            sx, sy = seed
+            lid = int(labels[sy, sx])
+            if lid > 0:
+                comp_mask = labels == lid
+
+        if comp_mask is not None and np.any(comp_mask):
+            dm = (comp_mask.astype(np.uint8)) * 255
+            source = "threshold_component"
+        else:
+            dm = _disk_mask(h, w, float(x), float(y), render_r).astype(np.uint8) * 255
+            source = "disk_fallback"
+
+        refined_applied = False
+        if (
+            refine is not None
+            and anomaly_map is not None
+            and str(refine.get("mode", "")).lower() == "hysteresis_local"
+        ):
+            dm = _refine_seed_hysteresis_local(
+                dm > 0,
+                anomaly_map,
+                margin_px=int(refine["margin_px"]),
+                max_fraction=float(refine["max_fraction"]),
+                mean_factor=refine.get("mean_factor"),
+                min_grow_t=float(refine["min_grow_t"]),
+                morph_k=int(refine["morph_k"]),
+                morph_iter=int(refine["morph_iter"]),
+            )
+            refined_applied = True
+
+        out = np.maximum(out, dm)
+        cnts, _ = cv2.findContours(dm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnt_arr = cnts[0] if cnts else np.zeros((1, 1, 2), dtype=np.float32)
+        ys, xs = np.where(dm > 0)
+        if xs.size > 0:
+            xmin, xmax = int(xs.min()), int(xs.max())
+            ymin, ymax = int(ys.min()), int(ys.max())
+        else:
+            xmin, xmax = x, x
+            ymin, ymax = y, y
+        area = float(np.count_nonzero(dm > 0))
+        mm = cv2.moments(dm)
+        if mm["m00"] > 1e-6:
+            cx = float(mm["m10"] / mm["m00"])
+            cy = float(mm["m01"] / mm["m00"])
+        else:
+            cx, cy = float(x), float(y)
+        eff_r = float(math.sqrt(max(0.0, area / math.pi))) if area > 0 else float(render_r)
+        peaks.append({
+            "candidate_id": rank,
+            "centroid_x": cx,
+            "centroid_y": cy,
+            "peak_score": fs,
+            "x": xmin,
+            "y": ymin,
+            "w": min(w, xmax + 1) - max(0, xmin),
+            "h": min(h, ymax + 1) - max(0, ymin),
+            "area": area,
+            "blob_radius_px": eff_r,
+            "contour": cnt_arr,
+            "kept_final": True,
+            "status_code": "kept",
+            "reject_reason": "",
+            "final_mask_source": source,
+            "final_mask_refined": refined_applied,
+        })
+
+    return out, peaks
 
 
 def _greedy_score_nms(
@@ -474,35 +721,27 @@ class PeakNMSPostprocessor(PostprocessorBase):
             else:
                 empty_reason = "no_candidates_after_nms"
 
-        out = np.zeros((h, w), dtype=np.uint8)
-        peaks: List[Dict[str, Any]] = []
         fin_rank: Dict[Tuple[int, int], int] = {}
         for rank, fin in enumerate(finalists, start=1):
             x, y = int(fin["x"]), int(fin["y"])
             fin_rank[(x, y)] = rank
             fin["kept"] = True
             fin["rank"] = rank
-            cv2.circle(out, (x, y), render_r, 255, thickness=-1)
-            fs = float(fin["final_score"])
-            dm = _disk_mask(h, w, float(x), float(y), render_r).astype(np.uint8)
-            cnts, _ = cv2.findContours(dm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cnt_arr = cnts[0] if cnts else np.zeros((1, 1, 2), dtype=np.float32)
-            peaks.append({
-                "candidate_id": rank,
-                "centroid_x": float(x),
-                "centroid_y": float(y),
-                "peak_score": fs,
-                "x": max(0, x - render_r),
-                "y": max(0, y - render_r),
-                "w": min(w, x + render_r + 1) - max(0, x - render_r),
-                "h": min(h, y + render_r + 1) - max(0, y - render_r),
-                "area": float(np.count_nonzero(dm > 0)),
-                "blob_radius_px": float(render_r),
-                "contour": cnt_arr,
-                "kept_final": True,
-                "status_code": "kept",
-                "reject_reason": "",
-            })
+
+        seed_r = int(_cfg_get(p, "threshold_component_seed_radius_px", 5))
+        morph_k = int(_cfg_get(p, "threshold_component_morph_kernel_px", 0))
+        refine_opts = _peak_refine_options_from_params(p)
+        out, peaks = _build_final_mask_from_threshold_components(
+            np.asarray(binary_mask_raw, dtype=bool),
+            finalists,
+            h=h,
+            w=w,
+            render_r=render_r,
+            seed_search_r=seed_r,
+            morph_kernel_px=morph_k,
+            anomaly_map=A,
+            refine=refine_opts,
+        )
 
         peak_coords = (
             np.array([[int(r["y"]), int(r["x"])] for r in scored], dtype=np.int32)
@@ -603,6 +842,8 @@ class PeakNMSPostprocessor(PostprocessorBase):
                 "post_accept_nms_radius_px": float(_cfg_get(p, "post_accept_nms_radius_px", 10.0)),
                 "max_kept_peaks": int(_cfg_get(p, "max_kept_peaks", 12)),
                 "mode": "gt_anchored",
+                "refine_component_support": bool(_cfg_get(p, "refine_component_support", True)),
+                "refine_mode": str(_cfg_get(p, "refine_mode", "hysteresis_local")),
             },
             "threshold_map": threshold_map,
             "num_peaks_selected": len(peaks),
@@ -810,31 +1051,20 @@ class PeakNMSPostprocessor(PostprocessorBase):
                 empty_reason = "no_candidates_after_nms"
 
         render_r = max(1, int(_cfg_get(p, "render_radius_px", 4)))
-        out = np.zeros((h, w), dtype=np.uint8)
-        peaks: List[Dict[str, Any]] = []
-        for rank, fin in enumerate(finalists, start=1):
-            x, y = int(fin["x"]), int(fin["y"])
-            cv2.circle(out, (x, y), render_r, 255, thickness=-1)
-            fs = float(fin["final_score"])
-            dm = _disk_mask(h, w, float(x), float(y), render_r).astype(np.uint8)
-            cnts, _ = cv2.findContours(dm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cnt_arr = cnts[0] if cnts else np.zeros((1, 1, 2), dtype=np.float32)
-            peaks.append({
-                "candidate_id": rank,
-                "centroid_x": float(x),
-                "centroid_y": float(y),
-                "peak_score": fs,
-                "x": max(0, x - render_r),
-                "y": max(0, y - render_r),
-                "w": min(w, x + render_r + 1) - max(0, x - render_r),
-                "h": min(h, y + render_r + 1) - max(0, y - render_r),
-                "area": float(np.count_nonzero(dm > 0)),
-                "blob_radius_px": float(render_r),
-                "contour": cnt_arr,
-                "kept_final": True,
-                "status_code": "kept",
-                "reject_reason": "",
-            })
+        seed_r = int(_cfg_get(p, "threshold_component_seed_radius_px", 5))
+        morph_k = int(_cfg_get(p, "threshold_component_morph_kernel_px", 0))
+        refine_opts = _peak_refine_options_from_params(p)
+        out, peaks = _build_final_mask_from_threshold_components(
+            np.asarray(binary_mask_raw, dtype=bool),
+            finalists,
+            h=h,
+            w=w,
+            render_r=render_r,
+            seed_search_r=seed_r,
+            morph_kernel_px=morph_k,
+            anomaly_map=A,
+            refine=refine_opts,
+        )
 
         fin_rank: Dict[Tuple[int, int], int] = {}
         for rank, fin in enumerate(finalists, start=1):
@@ -947,6 +1177,8 @@ class PeakNMSPostprocessor(PostprocessorBase):
                 "accept_score_threshold_source": accept_src,
                 "post_accept_nms_radius_px": nms_r,
                 "max_kept_peaks": max_kept,
+                "refine_component_support": bool(_cfg_get(p, "refine_component_support", True)),
+                "refine_mode": str(_cfg_get(p, "refine_mode", "hysteresis_local")),
             },
             "threshold_map": threshold_map,
             "num_peaks_selected": len(peaks),

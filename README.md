@@ -96,6 +96,10 @@ After thresholding candidates by score, **greedy score NMS** enforces a minimum 
 
 Final peak acceptance uses thresholds **derived from the statistics of the current candidate set** (e.g., pool size and score distribution), so behavior remains stable across images without relying on a single fixed global score cutoff.
 
+### 4.8 Local mask refinement (optional)
+
+After peaks are fixed, the final binary mask can **expand each accepted threshold component** inside a local ROI using the **continuous anomaly map**: a hysteresis-style rule keeps pixels at or above a relaxed cutoff (e.g., tied to the seed’s max anomaly) **only if** they belong to the same connected region as the seed when thresholded together with the seed (`growable = (A ≥ t) ∨ seed`). This recovers defect extent clipped by a strict MAD mask without introducing new peaks or distant blobs. Set `refine_mode` to `"none"` in `PeakNMSPostprocessConfig` to skip.
+
 ---
 
 ## 5. Visualization: multi-panel pipeline figures
@@ -118,11 +122,11 @@ Each row is a **left-to-right progression** through the pipeline. Typical panels
 | **2** | **Preprocessed Image** | After preprocessing (with a **gain** statistic vs. raw in the title). | Smoother, more comparable intensity domain. |
 | **3** | **Alignment Overlay** | **RG overlay**: reference in red channel, inspected in green—overlap appears yellow. Title lists **rotation (deg)** and **translation (px)** plus valid **overlap** fraction. | Good alignment: structures coincide (yellow); large red/green separation indicates misalignment. |
 | **4** | **Anomaly** | Continuous **anomaly map** (colormap, e.g. magma). Title may summarize comparator options (e.g., artifact-residual, top-hat size, edge handling) and **norm gain**. **Cyan crosses**: ground-truth defect locations when available. | Defects should appear as **bright, localized hotspots**. Broad sheets of activation suggest alignment or structured residual issues. |
-| **5** | **Thresholded Mask (Pre-Postprocess)** | Binary mask after **thresholding** the anomaly evidence (before peak extraction / NMS / disk rendering). Title includes the effective **threshold** value when available. GT markers repeated. | Indicates where the statistical test flags anomaly **before** postprocessing consolidates detections. |
-| **6** | **Final Binary Defect Mask** | **Final binary prediction** after all postprocessing (same as `DetectionResult.defect_mask`): **1 = predicted defect**, **0 = background**, nearest-neighbor display (no interpolation blur). | This is the **assignment-style deliverable**: a clean binary image of predicted defect locations. On non-defective cases it should be **empty (all background)**. It must match the regions shown in the next panel. |
-| **7** | **Final Detection + Ground Truth** | **Final detections** as contours/centers on a gray background (normalized inspected). Title shows **detection count** and **total area**. **Cyan crosses**: GT when available. | Visual confirmation that the binary mask (panel 6) aligns with rendered detections and optional GT. |
+| **5** | **Thresholded Mask (Pre-Postprocess)** | Binary mask after **thresholding** the anomaly evidence (before peak extraction / NMS). Title includes the effective **threshold** value when available. GT markers repeated. | Indicates where the statistical test flags anomaly **before** peaks are selected and merged into the final mask. |
+| **6** | **Final Binary Defect Mask** | **Final binary prediction** (same as `DetectionResult.defect_mask`): **1 = defect**, **0 = background**, `nearest` interpolation. Starts from threshold **connected components** per accepted peak (with disk fallback when needed), then optional **local hysteresis refinement** on the continuous anomaly map (ROI around each seed, relaxed cutoff, connectivity-only growth) to recover support that a strict MAD mask may clip—without adding detections elsewhere. | **Assignment-style deliverable**: fuller defect shapes while peak selection is unchanged. Non-defective cases stay **empty**. Matches the last panel. |
+| **7** | **Final Detection + Ground Truth** | **Contours** of the **same final mask** on normalized inspected. Title: detection **count** and **total area**. **Cyan crosses**: GT when available. | Confirms panel 6 and the contour view are one consistent prediction. |
 
-**Final Binary Defect Mask (panel 6):** This panel is the explicit **binary defect image** required for submission-style reporting: it shows only the **final** mask after thresholding, peak selection, NMS, and any configured postprocess—**not** the raw threshold mask from panel 5.
+**Final Binary Defect Mask (panel 6):** Post-peak-selection mask. Each kept peak still maps to the same threshold component (or disk fallback); **refinement** only expands that seed within a local ROI using the anomaly map (`PeakNMSPostprocessConfig`: `refine_component_support`, `refine_mode`, `refine_roi_margin_px`, `refine_growth_component_max_fraction`, etc.). Disable with `refine_mode: "none"` to show the strict threshold-union mask only.
 
 **Ground-truth overlays:** When annotation files are present for a pair, **cyan markers** denote known defect locations on panels that support them. They are for **evaluation and calibration** only—they do not drive the core detector in production configuration.
 

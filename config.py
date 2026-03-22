@@ -229,7 +229,7 @@ class PostprocessingConfig:
 
 @dataclass
 class PeakNMSPostprocessConfig:
-    """Continuous anomaly peak extraction + edge rejection + disk rendering (see ``peak_nms_postprocess``)."""
+    """Continuous anomaly peak extraction + edge rejection + threshold-component mask union (see ``peak_nms_postprocess``)."""
 
     enabled: bool = True
     gaussian_sigma: float = 2.0
@@ -262,6 +262,20 @@ class PeakNMSPostprocessConfig:
     # Deprecated: use accept_score_threshold; kept for params merge compatibility.
     min_best_score: float = 0.0
     render_radius_px: int = 4
+    # Map each kept peak to a connected component of ``binary_mask_raw`` (MAD threshold mask);
+    # nearest foreground search radius when the peak center is not on-mask. 0 disables search (disk only).
+    threshold_component_seed_radius_px: int = 5
+    # If > 0 (odd recommended, e.g. 3), one morphological close on the threshold mask before labeling.
+    threshold_component_morph_kernel_px: int = 0
+    # Local mask refinement after threshold components: hysteresis growth on ``anomaly_map`` inside ROI only.
+    refine_component_support: bool = True
+    refine_roi_margin_px: int = 8
+    refine_mode: str = "hysteresis_local"  # "none" | "hysteresis_local"
+    refine_growth_component_max_fraction: float = 0.45
+    refine_growth_component_mean_factor: Optional[float] = None
+    refine_min_growth_threshold: float = 0.0
+    refine_morph_close_kernel: int = 0
+    refine_morph_close_iterations: int = 0
     use_continuous_anomaly_only: bool = True
     gt_tolerance_px: float = 5.0
     gt_tolerance_loose_px: float = 7.0
