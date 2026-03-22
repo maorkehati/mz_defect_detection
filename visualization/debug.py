@@ -1843,21 +1843,21 @@ def save_compact_pipeline_figure(
     gt_pts = get_ground_truth_points_for_pair(pair_id)
 
     plt = _get_plt()
-    fig, axes = plt.subplots(1, 6, figsize=(18, 4))
+    fig, axes = plt.subplots(1, 7, figsize=(21, 4))
 
     raw_ins_arr = np.asarray(raw_ins, dtype=np.float32)
     axes[0].imshow(normalize_for_display(_to_gray(raw_ins_arr)), cmap="gray", vmin=0.0, vmax=1.0)
-    axes[0].set_title("Raw")
+    axes[0].set_title("Inspected Image")
     axes[0].axis("off")
     _draw_gt_markers_matplotlib(axes[0], gt_pts, raw_ins_arr.shape[1], raw_ins_arr.shape[0])
 
     axes[1].imshow(normalize_for_display(_to_gray(np.asarray(pre_ins, dtype=np.float32))), cmap="gray", vmin=0.0, vmax=1.0)
-    axes[1].set_title(f"Preprocess (gain={gain_pre:+.4f})")
+    axes[1].set_title(f"Preprocessed Image (gain={gain_pre:+.4f})")
     axes[1].axis("off")
 
     axes[2].imshow(overlay_rgb)
     axes[2].set_title(
-        f"Align (theta={float(theta):+.2f}, tx={float(tx):+.2f}, ty={float(ty):+.2f}, overlap={float(overlap):.3f})"
+        f"Alignment Overlay (theta={float(theta):+.2f}, tx={float(tx):+.2f}, ty={float(ty):+.2f}, overlap={float(overlap):.3f})"
     )
     axes[2].axis("off")
 
@@ -1895,15 +1895,22 @@ def save_compact_pipeline_figure(
 
     thr_mask = np.asarray(mask_raw if mask_raw is not None else np.zeros_like(show_anomaly, dtype=bool)).astype(np.float32)
     thr_txt = "NA" if threshold_value is None else f"{float(threshold_value):.4f}"
-    axes[4].imshow(thr_mask, cmap="gray", vmin=0.0, vmax=1.0)
-    axes[4].set_title(f"Threshold (t={thr_txt})")
+    axes[4].imshow(thr_mask, cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
+    axes[4].set_title(f"Thresholded Mask (Pre-Postprocess)\nt={thr_txt}")
     axes[4].axis("off")
     _draw_gt_markers_matplotlib(axes[4], gt_pts, int(thr_mask.shape[1]), int(thr_mask.shape[0]))
 
-    axes[5].imshow(contour_vis)
-    axes[5].set_title(f"Post (N={num_contours}, area={total_area:.1f})")
+    # Final prediction mask (same as DetectionResult.defect_mask / binary_mask_final after postprocess).
+    final_mask = mask_final if mask_final is not None else np.zeros_like(post_base, dtype=bool)
+    final_u8 = np.asarray(final_mask, dtype=np.float32)
+    axes[5].imshow(final_u8, cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
+    axes[5].set_title("Final Binary Defect Mask")
     axes[5].axis("off")
-    _draw_gt_markers_matplotlib(axes[5], gt_pts, int(contour_vis.shape[1]), int(contour_vis.shape[0]))
+
+    axes[6].imshow(contour_vis)
+    axes[6].set_title(f"Final Detection + Ground Truth\n(N={num_contours}, area={total_area:.1f})")
+    axes[6].axis("off")
+    _draw_gt_markers_matplotlib(axes[6], gt_pts, int(contour_vis.shape[1]), int(contour_vis.shape[0]))
 
     st = f"{pair_id} pipeline progression"
     if gt_pts:

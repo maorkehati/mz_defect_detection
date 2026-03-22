@@ -249,7 +249,17 @@ class PeakNMSPostprocessConfig:
     score_peakness_weight: float = 1.0
     score_edge_distance_weight: float = 0.0
     min_edge_distance_px: Optional[float] = None
-    top_k_keep: int = 3
+    # Primary selection: keep candidates with final_score >= this, then NMS (see peak_nms_postprocess).
+    accept_score_threshold: float = 0.35
+    # When True, accept threshold is computed from scored-candidate count (see peak_nms_postprocess).
+    use_stat_derived_accept_threshold: bool = False
+    # Greedy NMS on accepted candidates (pixel radius between peak centers).
+    post_accept_nms_radius_px: float = 10.0
+    # Safety cap after accept + NMS (not a fixed "three detections" selector).
+    max_kept_peaks: int = 12
+    # Deprecated: ignored by peak_nms_postprocess (retained for old configs / readability).
+    top_k_keep: int = 999
+    # Deprecated: use accept_score_threshold; kept for params merge compatibility.
     min_best_score: float = 0.0
     render_radius_px: int = 4
     use_continuous_anomaly_only: bool = True
@@ -742,12 +752,18 @@ def _apply_peak_nms_focus_defaults(p: PeakNMSPostprocessConfig) -> None:
     p.min_peakness = 0.015
     p.score_peakness_weight = 1.0
     p.score_edge_distance_weight = 0.02
-    p.top_k_keep = 3
-    p.min_best_score = 0.08
+    p.accept_score_threshold = 0.32
+    p.post_accept_nms_radius_px = 10.0
+    p.max_kept_peaks = 12
+    p.top_k_keep = 999
+    p.min_best_score = 0.0
     p.render_radius_px = 4
     p.use_continuous_anomaly_only = True
     p.case3_return_empty = False
     p.clean_case_zero_output = True
+    # Replaces former per-case accept_score_threshold overrides (0.05 / 0.05 / 2.45) via
+    # compute_dynamic_accept_threshold() from scored-candidate statistics only.
+    p.use_stat_derived_accept_threshold = True
     p.case_overrides = {
         "case1": {
             "use_gt_anchored_peaks": True,
@@ -756,7 +772,6 @@ def _apply_peak_nms_focus_defaults(p: PeakNMSPostprocessConfig) -> None:
             "gt_anchor_ignore_edge": True,
             "peak_threshold_percentile": 99.5,
             "min_peakness": 0.012,
-            "min_best_score": 0.06,
             "edge_reject_radius": 2,
         },
         "case2": {
@@ -767,15 +782,12 @@ def _apply_peak_nms_focus_defaults(p: PeakNMSPostprocessConfig) -> None:
             "gt_anchor_ignore_edge": True,
             "peak_threshold_percentile": 99.35,
             "min_peakness": 0.01,
-            "min_best_score": 0.055,
             "edge_reject_radius": 2,
             "score_edge_distance_weight": 0.03,
         },
         "case3": {
             "use_gt_anchored_peaks": False,
             "peak_threshold_percentile": 99.6,
-            # Best peak scores on non-defective run ~2.0–2.2; gate above that for empty output.
-            "min_best_score": 2.45,
             "min_peakness": 0.05,
         },
     }

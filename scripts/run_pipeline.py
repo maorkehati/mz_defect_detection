@@ -171,7 +171,7 @@ def _parse_args() -> argparse.Namespace:
   python scripts/run_pipeline.py --root-pattern "D:/datasets/my_cases/*"
 
 Primary outputs (under {out}):
-  <pair_id>_pipeline.png              — compact 6-panel progression (+ artifact_residual_debug.png)
+  <pair_id>_pipeline.png              — compact 7-panel progression (+ artifact_residual_debug.png)
   <pair_id>/detection_panels.png     — full detection figure (if --save-panels)
   <pair_id>/defect_mask.png          — binary mask (if --save-masks)
 Environment:
