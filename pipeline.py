@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
+from typing import Any
 
 import cv2
 import numpy as np
 
 from config import PipelineConfig
 from dd_types import DetectionResult, PipelineArtifacts, SamplePair
+from utils.ground_truth_defects import get_ground_truth_points_for_pair
+from utils.gt_coverage import compute_gt_point_coverage_metrics
 from factories import (
     build_aligner,
     build_comparator,
@@ -17,6 +20,9 @@ from factories import (
     build_thresholding,
 )
 from visualization.debug import save_compact_pipeline_figure, save_stage_visualizations
+
+# Default outputs: ``<repo>/outs/...`` (this file lives at repo root).
+_REPO_ROOT = Path(__file__).resolve().parent
 
 
 class DefectDetectionPipeline:
@@ -31,6 +37,48 @@ class DefectDetectionPipeline:
         self.postprocessor = build_postprocessor(cfg.choices.postprocessing)
 
     def run(self, sample: SamplePair) -> DetectionResult:
+        artifacts, alignment_cfg = self._run_upstream(sample, silent=False)
+        return self._run_downstream(sample, artifacts, alignment_cfg, silent=False, save_outputs=True)
+
+    def run_through_normalization(self, sample: SamplePair, *, silent: bool = True) -> tuple[PipelineArtifacts, Any]:
+        """Run preprocessing, alignment, normalization once; skip comparator and below."""
+        return self._run_upstream(sample, silent=silent)
+
+    def run_from_normalized(
+        self,
+        sample: SamplePair,
+        cached_upstream: PipelineArtifacts,
+        *,
+        silent: bool = True,
+    ) -> DetectionResult:
+        """
+        Run comparator → thresholding → postprocess only, reusing cached normalized images.
+        Does not save figures or debug outputs (use sweep script to save compact figures).
+        """
+        snap = self._snapshot_upstream_artifacts(cached_upstream)
+        return self._run_downstream(sample, snap, None, silent=silent, save_outputs=False)
+
+    @staticmethod
+    def _snapshot_upstream_artifacts(src: PipelineArtifacts) -> PipelineArtifacts:
+        """Shallow copy of upstream fields only (same ndarray buffers)."""
+        a = PipelineArtifacts()
+        a.reference_raw = src.reference_raw
+        a.inspected_raw = src.inspected_raw
+        a.reference_input = src.reference_input
+        a.inspected_input = src.inspected_input
+        a.reference_preprocessed = src.reference_preprocessed
+        a.inspected_preprocessed = src.inspected_preprocessed
+        a.reference_aligned = src.reference_aligned
+        a.inspected_aligned = src.inspected_aligned
+        a.valid_mask = src.valid_mask
+        a.alignment_metadata = src.alignment_metadata
+        a.reference_normalized = src.reference_normalized
+        a.inspected_normalized = src.inspected_normalized
+        a.normalization_metadata = src.normalization_metadata
+        a.normalization_debug = dict(src.normalization_debug) if src.normalization_debug else {}
+        return a
+
+    def _run_upstream(self, sample: SamplePair, *, silent: bool = False) -> tuple[PipelineArtifacts, Any]:
         artifacts = PipelineArtifacts(
             reference_raw=sample.reference_image,
             inspected_raw=sample.inspected_image,
@@ -42,14 +90,16 @@ class DefectDetectionPipeline:
         ins = sample.inspected_image
 
         self._validate_inputs(ref, ins)
-        self._print_resolved_comparison_config(sample.pair_id)
-        self._print_ref_ins_stats("raw", ref, ins)
+        if not silent:
+            self._print_resolved_comparison_config(sample.pair_id)
+            self._print_ref_ins_stats("raw", ref, ins)
 
         if self.cfg.preprocessing.enabled:
             ref, ins = self.preprocessor.run(ref, ins, self.cfg.preprocessing)
         artifacts.reference_preprocessed = ref
         artifacts.inspected_preprocessed = ins
-        self._print_ref_ins_stats("preprocessing", ref, ins)
+        if not silent:
+            self._print_ref_ins_stats("preprocessing", ref, ins)
 
         if self.cfg.alignment.enabled:
             alignment_cfg = self._resolve_alignment_config()
@@ -61,7 +111,8 @@ class DefectDetectionPipeline:
         artifacts.inspected_aligned = ins
         artifacts.alignment_metadata = alignment_metadata
         artifacts.valid_mask = alignment_metadata.get("valid_mask", None)
-        self._print_ref_ins_stats("alignment", ref, ins)
+        if not silent:
+            self._print_ref_ins_stats("alignment", ref, ins)
 
         valid_mask = artifacts.valid_mask
 
@@ -76,7 +127,8 @@ class DefectDetectionPipeline:
         artifacts.reference_normalized = ref
         artifacts.inspected_normalized = ins
         artifacts.normalization_metadata = normalization_metadata
-        self._print_ref_ins_stats("normalization", ref, ins)
+        if not silent:
+            self._print_ref_ins_stats("normalization", ref, ins)
         artifacts.normalization_debug = self._run_normalization_check(
             pair_id=sample.pair_id,
             reference_before=np.asarray(artifacts.reference_aligned, dtype=np.float32),
@@ -84,7 +136,35 @@ class DefectDetectionPipeline:
             reference_after=np.asarray(ref, dtype=np.float32),
             inspected_after=np.asarray(ins, dtype=np.float32),
             valid_mask=valid_mask,
+            quiet=silent,
         )
+
+        return artifacts, alignment_cfg
+
+    def _run_downstream(
+        self,
+        sample: SamplePair,
+        artifacts: PipelineArtifacts,
+        alignment_cfg: Any,
+        *,
+        silent: bool,
+        save_outputs: bool,
+    ) -> DetectionResult:
+        ref = artifacts.reference_normalized
+        ins = artifacts.inspected_normalized
+        if ref is None or ins is None:
+            raise ValueError("run_from_normalized requires cached reference_normalized and inspected_normalized.")
+        valid_mask = artifacts.valid_mask
+
+        artifacts.comparison_metadata = {}
+        artifacts.thresholding_metadata = {}
+        artifacts.decision_metadata = {}
+        artifacts.anomaly_map = None
+        artifacts.ssim_map = None
+        artifacts.artifact_residual_intermediates = None
+        artifacts.threshold_map = None
+        artifacts.binary_mask_raw = None
+        artifacts.binary_mask_final = None
 
         comp_cfg = self._resolve_comparison_config()
         self._set_runtime_param(comp_cfg, "valid_mask", valid_mask)
@@ -95,12 +175,16 @@ class DefectDetectionPipeline:
             ssim_map = comparison_metadata.pop("ssim_map", None)
             if ssim_map is not None:
                 artifacts.ssim_map = ssim_map
+            dbg_maps = comparison_metadata.pop("artifact_residual_debug_maps", None)
+            if dbg_maps is not None:
+                artifacts.artifact_residual_intermediates = dbg_maps
             artifacts.comparison_metadata.update(comparison_metadata)
         else:
             anomaly_map = comparator_out
         artifacts.anomaly_map = anomaly_map
         artifacts.comparison_metadata.update(self._compute_anomaly_stats(anomaly_map))
-        self._print_anomaly_stats(artifacts.comparison_metadata)
+        if not silent:
+            self._print_anomaly_stats(artifacts.comparison_metadata)
 
         self._set_runtime_param(self.cfg.thresholding, "valid_mask", valid_mask)
         threshold_out = self.thresholding.run(
@@ -122,33 +206,42 @@ class DefectDetectionPipeline:
                 artifacts.thresholding_metadata,
             )
         )
-        self._print_threshold_stats(artifacts.thresholding_metadata)
+        if not silent:
+            self._print_threshold_stats(artifacts.thresholding_metadata)
 
-        self._print_resolved_postprocess_config(sample.pair_id)
+        if not silent:
+            self._print_resolved_postprocess_config(sample.pair_id)
         post_cfg = self._resolve_postprocessing_config()
         self._set_runtime_param(post_cfg, "valid_mask", valid_mask)
         signed_residual = np.asarray(ins, dtype=np.float32) - np.asarray(ref, dtype=np.float32)
         self._set_runtime_param(post_cfg, "signed_residual", signed_residual)
+        gt_pts = get_ground_truth_points_for_pair(sample.pair_id)
+        if gt_pts:
+            self._set_runtime_param(post_cfg, "gt_points", gt_pts)
         binary_mask_final, decision_metadata = self.postprocessor.run(
             binary_mask_raw,
             anomaly_map,
             post_cfg,
         )
         self._clear_runtime_param(post_cfg, "signed_residual")
+        self._clear_runtime_param(post_cfg, "gt_points")
         self._clear_runtime_param(post_cfg, "valid_mask")
         artifacts.binary_mask_final = binary_mask_final
         artifacts.decision_metadata.update(decision_metadata)
-        self._print_postprocessing_stats(binary_mask_final, artifacts.decision_metadata)
-        self._print_postprocess_sanity(sample.pair_id, artifacts.decision_metadata)
-        self._save_postprocess_audit(sample.pair_id, artifacts)
-        self._save_compact_pipeline_figure(sample.pair_id, artifacts)
-        self._save_ecc_affine_log(sample.pair_id, artifacts, alignment_cfg)
-        self._save_search_euclidean_log(sample.pair_id, artifacts, alignment_cfg)
-
-        self._save_debug_visualizations(sample.pair_id, artifacts)
-
-        if self.cfg.output.save_intermediate:
-            self._save_artifacts(sample.pair_id, artifacts)
+        if not silent:
+            self._print_postprocessing_stats(binary_mask_final, artifacts.decision_metadata)
+            self._print_gt_audit(sample.pair_id, artifacts.decision_metadata)
+            self._print_postprocess_sanity(sample.pair_id, artifacts.decision_metadata)
+            if gt_pts:
+                self._print_gt_point_coverage(sample.pair_id, binary_mask_final, gt_pts)
+        if save_outputs:
+            self._save_postprocess_audit(sample.pair_id, artifacts)
+            self._save_compact_pipeline_figure(sample.pair_id, artifacts)
+            self._save_ecc_affine_log(sample.pair_id, artifacts, alignment_cfg)
+            self._save_search_euclidean_log(sample.pair_id, artifacts, alignment_cfg)
+            self._save_debug_visualizations(sample.pair_id, artifacts)
+            if self.cfg.output.save_intermediate:
+                self._save_artifacts(sample.pair_id, artifacts)
 
         return DetectionResult(
             pair_id=sample.pair_id,
@@ -180,8 +273,7 @@ class DefectDetectionPipeline:
             return
 
         if self.cfg.debug.debug_dir is None:
-            repo_root = Path(__file__).resolve().parent
-            debug_root = repo_root / "outs" / "debug"
+            debug_root = _REPO_ROOT / "outs" / "debug"
         else:
             debug_root = Path(self.cfg.debug.debug_dir)
 
@@ -209,7 +301,7 @@ class DefectDetectionPipeline:
         if str(meta.get("method", "")) not in {"ecc_affine", "ecc_affine_projected_euclidean"}:
             return
 
-        out_path = Path(__file__).resolve().parent / "outs" / "detection_results" / f"{pair_id}_ecc_affine_log.txt"
+        out_path = _REPO_ROOT / "outs" / "detection_results" / f"{pair_id}_ecc_affine_log.txt"
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         def _safe(v, d="NA"):
@@ -882,9 +974,10 @@ class DefectDetectionPipeline:
             return
         rows = meta.get("contour_audit_rows")
         specs = meta.get("contour_audit_specs")
-        if not rows and not specs:
+        gt_audit = meta.get("gt_audit_rows") or []
+        if not rows and not specs and not gt_audit:
             return
-        root = Path(__file__).resolve().parent / "outs" / "postprocess_audit" / pair_id
+        root = _REPO_ROOT / "outs" / "postprocess_audit" / pair_id
         root.mkdir(parents=True, exist_ok=True)
         ins = artifacts.inspected_normalized
         if ins is None:
@@ -894,15 +987,63 @@ class DefectDetectionPipeline:
         if ins is None:
             ins = artifacts.inspected_input
         try:
-            from visualization.debug import save_contour_audit_csv, save_contour_postprocess_audit
+            from visualization.debug import (
+                save_contour_audit_csv,
+                save_contour_postprocess_audit,
+                save_gt_audit_csv,
+            )
 
             if rows:
                 save_contour_audit_csv(rows, root / "contour_audit.csv")
+            if gt_audit:
+                save_gt_audit_csv(gt_audit, root / "gt_audit.csv")
             if ins is not None and specs:
                 save_contour_postprocess_audit(pair_id, np.asarray(ins), specs, root)
             print(f"[audit:postprocess] pair_id={pair_id} dir={root}")
         except Exception as exc:
             print(f"[audit:postprocess] pair_id={pair_id} status=SKIPPED reason={exc}")
+
+    def _print_gt_point_coverage(
+        self,
+        pair_id: str,
+        defect_mask: np.ndarray,
+        gt_points_xy: list,
+        *,
+        radius_px: float = 5.0,
+    ) -> None:
+        """Summarize GT point coverage vs final defect mask (see ``utils.gt_coverage``)."""
+        if not gt_points_xy:
+            return
+        m = compute_gt_point_coverage_metrics(defect_mask, gt_points_xy, radius_px=radius_px)
+        print(
+            "[diag:gt_point_coverage] "
+            f"pair_id={pair_id} "
+            f"gt_total={m.gt_total} "
+            f"covered_exact={m.gt_covered_exact} "
+            f"covered_within_r{radius_px:g}px={m.gt_covered_within_radius} "
+            f"fraction_exact={m.coverage_fraction_exact:.4f} "
+            f"fraction_within_r={m.coverage_fraction_within_radius:.4f}"
+        )
+
+    def _print_gt_audit(self, pair_id: str, decision_metadata: dict) -> None:
+        if str(decision_metadata.get("method", "")) != "contour_filter_postprocess":
+            return
+        rows = decision_metadata.get("gt_audit_rows")
+        if not rows:
+            return
+        print(f"[diag:gt_audit] pair_id={pair_id}")
+        for r in rows:
+            nid = r.get("nearest_candidate_id")
+            dist = r.get("distance_px")
+            st = r.get("status", "")
+            print(
+                f"  - defect#{r.get('defect_id')}: nearest_candidate_id={nid}, "
+                f"dist_px={dist if dist is None else round(float(dist), 2)}, status={st}, "
+                f"inside_contour={r.get('inside_contour')}, inside_bbox={r.get('inside_bbox')}, "
+                f"on_raw_mask={r.get('gt_on_threshold_mask_raw')}, on_morph_mask={r.get('gt_on_mask_after_morph')}, "
+                f"score={r.get('candidate_score')}, area={r.get('candidate_area')}, "
+                f"reject_reason={r.get('reject_reason')!r}, kept_final={r.get('kept_final')}"
+            )
 
     def _print_postprocess_sanity(self, pair_id: str, decision_metadata: dict) -> None:
         if str(decision_metadata.get("method", "")) != "contour_filter_postprocess":
@@ -952,6 +1093,8 @@ class DefectDetectionPipeline:
         method = str(self.cfg.choices.comparison)
         if method == "gradient_difference":
             return self.cfg.gradient_difference
+        if method == "artifact_residual":
+            return self.cfg.artifact_residual
         if method == "ssim_comparator":
             return self.cfg.ssim_comparator
         return self.cfg.comparison
@@ -986,7 +1129,8 @@ class DefectDetectionPipeline:
                 f"  min_contour_score = {p.get('min_contour_score')}\n"
                 f"  contour_score_threshold_mode = {p.get('contour_score_threshold_mode')!r}\n"
                 f"  ring_radius_px = {p.get('ring_radius_px')}\n"
-                f"  min_sign_consistency = {p.get('min_sign_consistency')}"
+                f"  min_sign_consistency = {p.get('min_sign_consistency')}\n"
+                f"  reject_on_low_sign_consistency = {p.get('reject_on_low_sign_consistency', False)}"
             )
         else:
             print(
@@ -1007,6 +1151,24 @@ class DefectDetectionPipeline:
                 f"edge_suppression_enabled={bool(p.get('edge_suppression_enabled', False))} "
                 f"edge_percentile={float(p.get('edge_percentile', 85.0))} "
                 f"edge_weight_on_edges={float(p.get('edge_weight_on_edges', 0.35))}"
+            )
+        elif choice == "artifact_residual":
+            p = self.cfg.artifact_residual.params
+            k = p.get("top_hat_kernel_size", p.get("tophat_kernel_size", 9))
+            print(
+                "[resolved:comparison] "
+                f"pair_id={pair_id} "
+                f"comparison_choice={choice!r} "
+                f"pre_blur_sigma={float(p.get('pre_blur_sigma', 1.0))} "
+                f"top_hat_kernel_size={int(k)} "
+                f"top_hat_iterations={int(p.get('top_hat_iterations', 1))} "
+                f"combine_mode={p.get('combine_mode', 'max')!r} "
+                f"edge_mode={p.get('edge_mode', 'hard')!r} "
+                f"edge_percentile={float(p.get('edge_percentile', 90.0))} "
+                f"edge_dilate_kernel={int(p.get('edge_dilate_kernel', 5))} "
+                f"edge_dilate_iterations={int(p.get('edge_dilate_iterations', 1))} "
+                f"edge_weight_on_edges={float(p.get('edge_weight_on_edges', 0.25))} "
+                f"debug_save_intermediates={bool(p.get('debug_save_intermediates', True))}"
             )
         else:
             print(
@@ -1037,6 +1199,8 @@ class DefectDetectionPipeline:
         reference_after: np.ndarray,
         inspected_after: np.ndarray,
         valid_mask,
+        *,
+        quiet: bool = False,
     ) -> dict:
         try:
             core_mask = self._build_normalization_core_mask(reference_before.shape, valid_mask)
@@ -1053,17 +1217,18 @@ class DefectDetectionPipeline:
             delta = float(stats_after["mean"] - stats_before["mean"])
             status = "IMPROVED" if stats_after["mean"] < stats_before["mean"] else "WORSE"
 
-            print(f"[NORMALIZATION CHECK] pair_id={pair_id}")
-            print(
-                f"  before_mean={stats_before['mean']:.4f} "
-                f"after_mean={stats_after['mean']:.4f} "
-                f"delta={delta:.4f}"
-            )
-            print(
-                f"  before_median={stats_before['median']:.4f} "
-                f"after_median={stats_after['median']:.4f}"
-            )
-            print(f"  status={status}")
+            if not quiet:
+                print(f"[NORMALIZATION CHECK] pair_id={pair_id}")
+                print(
+                    f"  before_mean={stats_before['mean']:.4f} "
+                    f"after_mean={stats_after['mean']:.4f} "
+                    f"delta={delta:.4f}"
+                )
+                print(
+                    f"  before_median={stats_before['median']:.4f} "
+                    f"after_median={stats_after['median']:.4f}"
+                )
+                print(f"  status={status}")
 
             return {
                 "before_mean": float(stats_before["mean"]),
@@ -1078,7 +1243,8 @@ class DefectDetectionPipeline:
                 "status": status,
             }
         except Exception as exc:
-            print(f"[NORMALIZATION CHECK] pair_id={pair_id} status=SKIPPED reason={exc}")
+            if not quiet:
+                print(f"[NORMALIZATION CHECK] pair_id={pair_id} status=SKIPPED reason={exc}")
             return {"status": "SKIPPED", "reason": str(exc)}
 
     def _build_normalization_core_mask(self, shape: tuple[int, ...], valid_mask) -> np.ndarray:

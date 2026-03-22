@@ -40,6 +40,9 @@ class PipelineArtifacts:
     anomaly_map: Optional[Array] = None
     ssim_map: Optional[Array] = None
     comparison_metadata: Dict[str, Any] = field(default_factory=dict)
+    # Populated when comparison is artifact_residual and debug_save_intermediates is True:
+    # dict of numpy arrays (residuals, enhanced maps, edge mask, etc.), not merged into comparison_metadata.
+    artifact_residual_intermediates: Optional[Dict[str, Any]] = None
     threshold_map: Optional[Array] = None
     thresholding_metadata: Dict[str, Any] = field(default_factory=dict)
     binary_mask_raw: Optional[Array] = None

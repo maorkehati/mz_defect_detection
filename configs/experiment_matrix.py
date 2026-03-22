@@ -1,8 +1,16 @@
+"""
+Experiment list for ``scripts/run_experiments.py``.
+
+For one interactive run with the default artifact_residual config, use ``scripts/run_pipeline.py``.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
-ROOT_PATTERN = r"C:\Users\mayoa\Desktop\home exercise\*"
+# Dataset glob (inputs). Default: sibling folder of the ``defect_detection`` repo; override in-script or per-run.
+_REPO = Path(__file__).resolve().parent.parent
+ROOT_PATTERN = str(_REPO.parent / "*")
 INSPECTED_PATTERN = "case*_inspected_image.tif"
 REFERENCE_PATTERN = "case*_reference_image.tif"
 
@@ -23,21 +31,22 @@ class ExperimentSpec:
 
 
 """
-Archived experiments are temporarily disabled while we stabilize one strong default configuration.
-We are focusing on coarse-to-fine Euclidean search alignment + gradient-difference + MAD threshold + contour filtering first.
+Primary focused experiments are **artifact_residual** (signed residual + top-hat) and
+**gradient-difference** (legacy comparison path). Both use search Euclidean + MAD + contour filtering.
 """
 
 EXPERIMENTS: list[ExperimentSpec] = [
-    # Chosen as the main stabilization path because:
-    # - global alignment is needed
-    # - small rotation may be present
-    # - ORB was unstable on repetitive shapes
-    # - SSIM is more interpretable than raw abs diff here
-    # - Otsu is a reasonable non-hand-tuned threshold for first-pass debugging
+    # Default "active path": comparator handles edges/artifacts; simpler contour postprocess.
+    ExperimentSpec(
+        name="focus_search_euclidean_artifact_residual_mad",
+        variant="search_euclidean_artifact_residual_mad",
+        description="Primary path: search Euclidean + linear gain/offset + artifact_residual + MAD + contour filtering",
+        overrides={},
+    ),
     ExperimentSpec(
         name="focus_search_euclidean_gradient_difference_edge_suppressed_mad",
         variant="search_euclidean_gradient_difference_edge_suppressed_mad",
-        description="Focused main configuration: search Euclidean + gradient-difference with edge suppression + MAD + contour filtering",
+        description="Focused configuration: search Euclidean + gradient-difference with edge suppression + MAD + contour filtering",
         overrides={},
     ),
     # -----------------------------

@@ -12,6 +12,13 @@ except Exception:
     pass
 
 try:
+    from .artifact_residual import ArtifactResidualComparator
+
+    __all__.append("ArtifactResidualComparator")
+except Exception:
+    pass
+
+try:
     from .ssim_comparator import SsimComparator
 
     __all__.append("SsimComparator")

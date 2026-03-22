@@ -1,0 +1,5 @@
+# Core dependencies for defect_detection (install with: pip install -r requirements.txt)
+numpy>=1.20
+opencv-python-headless>=4.5
+scikit-image>=0.19
+tqdm>=4.65

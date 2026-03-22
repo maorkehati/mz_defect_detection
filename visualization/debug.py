@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -7,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from dd_types import PipelineArtifacts
+from utils.ground_truth_defects import get_ground_truth_points_for_pair
 
 if TYPE_CHECKING:
     import matplotlib.pyplot as plt
@@ -1271,6 +1273,53 @@ def _save_contour_boxes_overlay(path: Path, inspected: np.ndarray, metadata: dic
     plt.close(fig)
 
 
+def save_gt_audit_csv(rows: list[dict[str, Any]], path: Path) -> None:
+    """Ground-truth vs nearest post-geom candidate audit (one row per GT defect)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "defect_id",
+        "gt_x",
+        "gt_y",
+        "nearest_candidate_id",
+        "distance_px",
+        "inside_contour",
+        "inside_bbox",
+        "gt_on_threshold_mask_raw",
+        "gt_on_mask_after_morph",
+        "candidate_area",
+        "candidate_score",
+        "sign_consistency",
+        "reject_reason",
+        "kept_final",
+        "status",
+    ]
+    if not rows:
+        path.write_text(",".join(fieldnames) + "\n", encoding="utf-8")
+        return
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow({
+                "defect_id": r.get("defect_id"),
+                "gt_x": r.get("gt_x"),
+                "gt_y": r.get("gt_y"),
+                "nearest_candidate_id": r.get("nearest_candidate_id"),
+                "distance_px": r.get("distance_px"),
+                "inside_contour": r.get("inside_contour"),
+                "inside_bbox": r.get("inside_bbox"),
+                "gt_on_threshold_mask_raw": r.get("gt_on_threshold_mask_raw"),
+                "gt_on_mask_after_morph": r.get("gt_on_mask_after_morph"),
+                "candidate_area": r.get("candidate_area"),
+                "candidate_score": r.get("candidate_score"),
+                "sign_consistency": r.get("sign_consistency"),
+                "reject_reason": r.get("reject_reason"),
+                "kept_final": r.get("kept_final"),
+                "status": r.get("status"),
+            })
+
+
 def save_contour_audit_csv(rows: list[dict[str, Any]], path: Path) -> None:
     """One row per geometrically valid scored contour; columns match postprocess audit."""
     path = Path(path)
@@ -1281,6 +1330,7 @@ def save_contour_audit_csv(rows: list[dict[str, Any]], path: Path) -> None:
         "score",
         "kept_final",
         "reject_reason",
+        "reject_stage",
         "mean_inside",
         "p95_inside",
         "ring_mean",
@@ -1300,6 +1350,7 @@ def save_contour_audit_csv(rows: list[dict[str, Any]], path: Path) -> None:
                 "score": r["ranking_score"],
                 "kept_final": r["kept_final"],
                 "reject_reason": r.get("reject_reason", ""),
+                "reject_stage": r.get("reject_stage", ""),
                 "mean_inside": r["mean_inside"],
                 "p95_inside": r["p95_inside"],
                 "ring_mean": r["ring_mean"],
@@ -1308,11 +1359,75 @@ def save_contour_audit_csv(rows: list[dict[str, Any]], path: Path) -> None:
             })
 
 
+def _draw_gt_markers_matplotlib(
+    ax,
+    gt_points: list[tuple[int, int]] | None,
+    img_w: int,
+    img_h: int,
+    *,
+    color: str = "cyan",
+) -> None:
+    """Draw crosshairs + 1-based index on an image axis (pixel coords, origin top-left)."""
+    if not gt_points:
+        return
+    c = max(3, min(12, max(img_w, img_h) // 48))
+    for i, (x, y) in enumerate(gt_points, start=1):
+        xi, yi = int(x), int(y)
+        if not (0 <= xi < img_w and 0 <= yi < img_h):
+            continue
+        ax.plot([xi - c, xi + c], [yi, yi], color=color, linewidth=1.25, zorder=20)
+        ax.plot([xi, xi], [yi - c, yi + c], color=color, linewidth=1.25, zorder=20)
+        ax.text(
+            min(img_w - 1, xi + 4),
+            max(0, yi - 4),
+            str(i),
+            color=color,
+            fontsize=7,
+            fontweight="bold",
+            zorder=21,
+            clip_on=True,
+        )
+
+
+def _draw_gt_markers_cv2(
+    bgr: np.ndarray,
+    gt_points: list[tuple[int, int]] | None,
+) -> None:
+    """Cyan-like crosshairs in BGR (255,255,0) + small labels; mutates bgr in place."""
+    if not gt_points:
+        return
+    try:
+        import cv2
+    except Exception:
+        return
+    h, w = int(bgr.shape[0]), int(bgr.shape[1])
+    c = max(3, min(12, max(w, h) // 48))
+    col = (255, 255, 0)  # cyan in BGR
+    for i, (x, y) in enumerate(gt_points, start=1):
+        xi, yi = int(x), int(y)
+        if not (0 <= xi < w and 0 <= yi < h):
+            continue
+        cv2.line(bgr, (xi - c, yi), (xi + c, yi), col, 1, cv2.LINE_AA)
+        cv2.line(bgr, (xi, yi - c), (xi, yi + c), col, 1, cv2.LINE_AA)
+        cv2.putText(
+            bgr,
+            str(i),
+            (min(w - 8, xi + 4), max(12, yi - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            col,
+            1,
+            cv2.LINE_AA,
+        )
+
+
 def save_contour_postprocess_audit(
     pair_id: str,
     inspected: np.ndarray,
     audit_specs: list[dict[str, Any]],
     output_dir: str | Path,
+    *,
+    gt_points: list[tuple[int, int]] | None = None,
 ) -> None:
     """
     Overlay all scored candidates on inspected image.
@@ -1355,8 +1470,11 @@ def save_contour_postprocess_audit(
             1,
             cv2.LINE_AA,
         )
+    pts = gt_points if gt_points is not None else get_ground_truth_points_for_pair(pair_id)
+    _draw_gt_markers_cv2(bgr, pts)
     legend_y = 18
-    cv2.putText(bgr, f"{pair_id} green=kept yellow=score_thr red=topk_cap", (8, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    cap = f"{pair_id} green=kept yellow=score_thr red=topk_cap cyan=GT"
+    cv2.putText(bgr, cap, (8, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
     out_path = out_dir / "contour_audit_overlay.png"
     cv2.imwrite(str(out_path), bgr)
 
@@ -1394,6 +1512,239 @@ def _run_comparator_map(
     if isinstance(out, tuple) and len(out) == 2:
         return np.asarray(out[0], dtype=np.float32)
     return np.asarray(out, dtype=np.float32)
+
+
+def _gray_with_invalid(
+    img: np.ndarray,
+    valid_mask: np.ndarray | None,
+    *,
+    invalid_level: float = 0.55,
+) -> np.ndarray:
+    """Normalize to [0,1] gray; outside valid overlap set to neutral gray."""
+    g = normalize_for_display(_to_gray(np.asarray(img, dtype=np.float32)))
+    if valid_mask is None:
+        return g
+    vm = np.asarray(valid_mask).astype(bool)
+    if vm.shape != g.shape:
+        return g
+    return np.where(vm, g, invalid_level).astype(np.float32)
+
+
+def _ensure_artifact_residual_debug_maps(
+    artifacts: PipelineArtifacts,
+    comparator,
+    comparator_cfg: Any,
+) -> dict[str, Any] | None:
+    """
+    Return artifact_residual intermediate maps from artifacts, or re-run comparator once
+    with debug_save_intermediates=True (does not mutate comparator_cfg).
+    """
+    comp_meta = getattr(artifacts, "comparison_metadata", None) or {}
+    is_art = comp_meta.get("method") == "artifact_residual" or getattr(comparator, "name", None) == "artifact_residual"
+    if not is_art:
+        return None
+
+    inter = getattr(artifacts, "artifact_residual_intermediates", None)
+    if isinstance(inter, dict) and "residual_signed" in inter and inter["residual_signed"] is not None:
+        return inter
+
+    if comparator_cfg is None:
+        return None
+    cfg = copy.deepcopy(comparator_cfg)
+    if not hasattr(cfg, "params") or cfg.params is None:
+        cfg.params = {}
+    cfg.params["debug_save_intermediates"] = True
+    vm = getattr(artifacts, "valid_mask", None)
+    if vm is not None:
+        cfg.params["valid_mask"] = np.asarray(vm)
+
+    ref = artifacts.reference_normalized
+    ins = artifacts.inspected_normalized
+    if ref is None or ins is None:
+        return None
+
+    out = comparator.run(
+        np.asarray(ref, dtype=np.float32),
+        np.asarray(ins, dtype=np.float32),
+        cfg,
+    )
+    if isinstance(out, tuple) and len(out) == 2:
+        _amap, meta = out
+        dbg = meta.get("artifact_residual_debug_maps") if isinstance(meta, dict) else None
+        if isinstance(dbg, dict) and dbg.get("residual_signed") is not None:
+            return dbg
+    return None
+
+
+def save_artifact_residual_diagnostic_figure(
+    pair_id: str,
+    artifacts: PipelineArtifacts,
+    comparator,
+    comparator_cfg: Any,
+    output_path: str | Path,
+) -> None:
+    """
+    3×3 diagnostic figure for artifact_residual: normalized inputs, residuals, top-hat channels,
+    edge mask, final anomaly, threshold, postprocess. Saves under repo output paths only.
+
+    Uses ``artifacts.artifact_residual_intermediates`` when present; otherwise re-runs the
+    comparator once with ``debug_save_intermediates=True``.
+    """
+    comp_meta = getattr(artifacts, "comparison_metadata", None) or {}
+    if comp_meta.get("method") != "artifact_residual" and getattr(comparator, "name", None) != "artifact_residual":
+        return
+
+    dbg = _ensure_artifact_residual_debug_maps(artifacts, comparator, comparator_cfg)
+    if dbg is None:
+        return
+
+    norm_ins = artifacts.inspected_normalized
+    norm_ref = artifacts.reference_normalized
+    if norm_ins is None or norm_ref is None:
+        return
+
+    vm = None if artifacts.valid_mask is None else np.asarray(artifacts.valid_mask).astype(bool)
+    gt_pts = get_ground_truth_points_for_pair(pair_id)
+
+    residual_signed = np.asarray(dbg["residual_signed"], dtype=np.float32)
+    enh_pos = np.asarray(dbg["enhanced_positive"], dtype=np.float32)
+    enh_neg = np.asarray(dbg["enhanced_negative"], dtype=np.float32)
+    edge_mask = np.asarray(dbg.get("edge_mask_dilated", 0.0), dtype=np.float32)
+
+    anomaly_map = artifacts.anomaly_map
+    if anomaly_map is None:
+        return
+    anomaly_map = np.asarray(anomaly_map, dtype=np.float32)
+
+    mask_raw = artifacts.binary_mask_raw
+    thr_mask = np.asarray(
+        mask_raw if mask_raw is not None else np.zeros_like(anomaly_map, dtype=bool),
+        dtype=np.float32,
+    )
+
+    post_base = np.asarray(norm_ins, dtype=np.float32)
+    mask_final = artifacts.binary_mask_final
+    post_mask = mask_final if mask_final is not None else (mask_raw if mask_raw is not None else np.zeros_like(post_base, dtype=bool))
+    contour_vis, num_contours, total_area = draw_contours_and_centers(post_base, np.asarray(post_mask))
+
+    edge_mode = str(comp_meta.get("edge_mode", "?"))
+    frac_edge = float(comp_meta.get("fraction_anomaly_touched_by_edge_mask", 0.0))
+
+    # Signed residual: diverging colormap; invalid overlap → NaN (matplotlib shows as bad color)
+    rs = residual_signed.astype(np.float32).copy()
+    if vm is not None and rs.shape == vm.shape:
+        rs[~vm] = np.nan
+    finite = np.isfinite(rs)
+    if np.any(finite):
+        vmax_abs = float(np.nanmax(np.abs(rs)))
+    else:
+        vmax_abs = 0.0
+    if vmax_abs <= 1e-12:
+        rs_disp = np.zeros_like(rs, dtype=np.float32)
+    else:
+        rs_disp = np.clip(rs / vmax_abs, -1.0, 1.0)
+    if vm is not None and rs_disp.shape == vm.shape:
+        rs_disp[~vm] = np.nan
+
+    plt = _get_plt()
+    fig, axes = plt.subplots(3, 3, figsize=(16, 14))
+    _cms = getattr(plt, "colormaps", None)
+    if _cms is not None:
+        cmap_div = _cms["coolwarm"].copy()
+    else:
+        cmap_div = plt.cm.coolwarm.copy()
+    cmap_div.set_bad((0.78, 0.78, 0.82, 1.0))
+
+    h0, w0 = int(norm_ins.shape[0]), int(norm_ins.shape[1])
+
+    axes[0, 0].imshow(_gray_with_invalid(norm_ins, vm), cmap="gray", vmin=0.0, vmax=1.0)
+    axes[0, 0].set_title("Inspected (normalized)\n(outside overlap = neutral gray)")
+    axes[0, 0].axis("off")
+    _draw_gt_markers_matplotlib(axes[0, 0], gt_pts, w0, h0)
+
+    axes[0, 1].imshow(_gray_with_invalid(norm_ref, vm), cmap="gray", vmin=0.0, vmax=1.0)
+    axes[0, 1].set_title("Reference (normalized, aligned)")
+    axes[0, 1].axis("off")
+    _draw_gt_markers_matplotlib(axes[0, 1], gt_pts, w0, h0)
+
+    axes[0, 2].imshow(rs_disp, cmap=cmap_div, vmin=-1.0, vmax=1.0, interpolation="nearest")
+    axes[0, 2].set_title("Signed residual (ins − ref)\nscaled to ±1 by |max| in valid overlap")
+    axes[0, 2].axis("off")
+    _draw_gt_markers_matplotlib(axes[0, 2], gt_pts, residual_signed.shape[1], residual_signed.shape[0])
+
+    def _heatmap_top_hat(arr: np.ndarray) -> np.ndarray:
+        a = np.asarray(arr, dtype=np.float32).copy()
+        if vm is not None and a.shape == vm.shape:
+            a[~vm] = np.nan
+        if not np.any(np.isfinite(a)):
+            return np.zeros_like(a, dtype=np.float32)
+        lo = float(np.nanpercentile(a, 1.0))
+        hi = float(np.nanpercentile(a, 99.0))
+        if hi <= lo:
+            out = np.zeros_like(a, dtype=np.float32)
+        else:
+            out = np.clip((a - lo) / (hi - lo), 0.0, 1.0)
+        if vm is not None and out.shape == vm.shape:
+            out = np.where(vm, out, 0.35)
+        return out
+
+    axes[1, 0].imshow(_heatmap_top_hat(enh_pos), cmap="magma", vmin=0.0, vmax=1.0)
+    axes[1, 0].set_title("Bright residual → white top-hat\n(enhanced Δ+)")
+    axes[1, 0].axis("off")
+    _draw_gt_markers_matplotlib(axes[1, 0], gt_pts, enh_pos.shape[1], enh_pos.shape[0])
+
+    axes[1, 1].imshow(_heatmap_top_hat(enh_neg), cmap="magma", vmin=0.0, vmax=1.0)
+    axes[1, 1].set_title("Dark residual → white top-hat\n(enhanced Δ−)")
+    axes[1, 1].axis("off")
+    _draw_gt_markers_matplotlib(axes[1, 1], gt_pts, enh_neg.shape[1], enh_neg.shape[0])
+
+    emax = float(np.max(edge_mask)) if edge_mask.size else 0.0
+    axes[1, 2].imshow(np.clip(edge_mask, 0.0, 1.0), cmap="gray", vmin=0.0, vmax=1.0)
+    t_edge = f"Strong-edge mask (dilated)\nmode={edge_mode}, frac(anomaly on mask)={frac_edge:.3f}"
+    if emax < 1e-6 and edge_mode == "off":
+        t_edge = "Edge mask (edge_mode=off)\n(no suppression)"
+    axes[1, 2].set_title(t_edge)
+    axes[1, 2].axis("off")
+    _draw_gt_markers_matplotlib(axes[1, 2], gt_pts, edge_mask.shape[1], edge_mask.shape[0])
+
+    show_an = normalize_for_display(anomaly_map)
+    if vm is not None and show_an.shape == vm.shape:
+        show_an = np.where(vm, show_an, 0.35)
+    axes[2, 0].imshow(show_an, cmap="magma", vmin=0.0, vmax=1.0)
+    ks = int(comp_meta.get("top_hat_kernel_size", comp_meta.get("tophat_kernel_size", 9)))
+    nit = int(comp_meta.get("top_hat_iterations", 1))
+    axes[2, 0].set_title(f"Final anomaly [0,1]\nartifact_residual k={ks}×{nit}, edge={edge_mode}")
+    axes[2, 0].axis("off")
+    _draw_gt_markers_matplotlib(axes[2, 0], gt_pts, anomaly_map.shape[1], anomaly_map.shape[0])
+
+    thr_val = None
+    if artifacts.thresholding_metadata:
+        thr_val = artifacts.thresholding_metadata.get("threshold")
+        if thr_val is None:
+            thr_val = artifacts.thresholding_metadata.get("threshold_value")
+    thr_txt = "NA" if thr_val is None else f"{float(thr_val):.4f}"
+    axes[2, 1].imshow(thr_mask, cmap="gray", vmin=0.0, vmax=1.0)
+    axes[2, 1].set_title(f"Threshold mask (raw)\nt = {thr_txt}")
+    axes[2, 1].axis("off")
+    _draw_gt_markers_matplotlib(axes[2, 1], gt_pts, thr_mask.shape[1], thr_mask.shape[0])
+
+    axes[2, 2].imshow(contour_vis)
+    axes[2, 2].set_title(f"Postprocess (kept)\nN={num_contours}, area={total_area:.1f}")
+    axes[2, 2].axis("off")
+    _draw_gt_markers_matplotlib(axes[2, 2], gt_pts, contour_vis.shape[1], contour_vis.shape[0])
+
+    p_low = float(comp_meta.get("norm_percentile_low", 1.0))
+    p_high = float(comp_meta.get("norm_percentile_high", 99.0))
+    st = (
+        f"{pair_id}  |  artifact_residual diagnostics  |  cyan = GT  |  "
+        f"norm pct [{p_low},{p_high}]  |  edge p{comp_meta.get('edge_percentile', '?')}"
+    )
+    fig.suptitle(st, fontsize=10)
+    fig.tight_layout()
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def draw_contours_and_centers(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, int, float]:
@@ -1489,12 +1840,16 @@ def save_compact_pipeline_figure(
     post_mask = mask_final if mask_final is not None else (mask_raw if mask_raw is not None else np.zeros_like(post_base, dtype=bool))
     contour_vis, num_contours, total_area = draw_contours_and_centers(post_base, np.asarray(post_mask))
 
+    gt_pts = get_ground_truth_points_for_pair(pair_id)
+
     plt = _get_plt()
     fig, axes = plt.subplots(1, 6, figsize=(18, 4))
 
-    axes[0].imshow(normalize_for_display(_to_gray(np.asarray(raw_ins, dtype=np.float32))), cmap="gray", vmin=0.0, vmax=1.0)
+    raw_ins_arr = np.asarray(raw_ins, dtype=np.float32)
+    axes[0].imshow(normalize_for_display(_to_gray(raw_ins_arr)), cmap="gray", vmin=0.0, vmax=1.0)
     axes[0].set_title("Raw")
     axes[0].axis("off")
+    _draw_gt_markers_matplotlib(axes[0], gt_pts, raw_ins_arr.shape[1], raw_ins_arr.shape[0])
 
     axes[1].imshow(normalize_for_display(_to_gray(np.asarray(pre_ins, dtype=np.float32))), cmap="gray", vmin=0.0, vmax=1.0)
     axes[1].set_title(f"Preprocess (gain={gain_pre:+.4f})")
@@ -1520,27 +1875,72 @@ def save_compact_pipeline_figure(
         an_title = (
             f"Anomaly (edge_suppr={edge_suppr}, frac={frac:.2f}, w={ew:.2f}, norm_gain={gain_norm:+.4f})"
         )
+    elif comp_meta.get("method") == "artifact_residual":
+        ks = int(comp_meta.get("top_hat_kernel_size", comp_meta.get("tophat_kernel_size", 9)))
+        nit = int(comp_meta.get("top_hat_iterations", 1))
+        em = str(comp_meta.get("edge_mode", "off"))
+        bmean = float(comp_meta.get("bright_artifact_mean", 0.0))
+        dmean = float(comp_meta.get("dark_artifact_mean", 0.0))
+        f_edge = float(comp_meta.get("fraction_anomaly_touched_by_edge_mask", 0.0))
+        epct = comp_meta.get("edge_percentile", "?")
+        an_title = (
+            f"Anomaly: artifact_residual  |  top-hat k={ks}×{nit}  |  edge={em}  p={epct}\n"
+            f"brightμ={bmean:.4f} darkμ={dmean:.4f}  |  frac on edge-mask={f_edge:.3f}  |  norm_gain={gain_norm:+.4f}"
+        )
     else:
         an_title = f"Anomaly (norm_gain={gain_norm:+.4f})"
-    axes[3].set_title(an_title)
+    axes[3].set_title(an_title, fontsize=8 if comp_meta.get("method") == "artifact_residual" else 10)
     axes[3].axis("off")
+    _draw_gt_markers_matplotlib(axes[3], gt_pts, int(show_anomaly.shape[1]), int(show_anomaly.shape[0]))
 
     thr_mask = np.asarray(mask_raw if mask_raw is not None else np.zeros_like(show_anomaly, dtype=bool)).astype(np.float32)
     thr_txt = "NA" if threshold_value is None else f"{float(threshold_value):.4f}"
     axes[4].imshow(thr_mask, cmap="gray", vmin=0.0, vmax=1.0)
     axes[4].set_title(f"Threshold (t={thr_txt})")
     axes[4].axis("off")
+    _draw_gt_markers_matplotlib(axes[4], gt_pts, int(thr_mask.shape[1]), int(thr_mask.shape[0]))
 
     axes[5].imshow(contour_vis)
     axes[5].set_title(f"Post (N={num_contours}, area={total_area:.1f})")
     axes[5].axis("off")
+    _draw_gt_markers_matplotlib(axes[5], gt_pts, int(contour_vis.shape[1]), int(contour_vis.shape[0]))
 
-    fig.suptitle(f"{pair_id} pipeline progression", fontsize=11)
+    st = f"{pair_id} pipeline progression"
+    if gt_pts:
+        st += "  (cyan = ground-truth defect locations)"
+    summary_bits: list[str] = []
+    cm = comp_meta.get("method") or getattr(comparator, "name", "")
+    if cm:
+        summary_bits.append(f"comparator={cm}")
+    thr_m = getattr(artifacts, "thresholding_metadata", None) or {}
+    if thr_m.get("k_mad") is not None:
+        summary_bits.append(f"k_mad={float(thr_m['k_mad']):.2f}")
+    if comp_meta.get("method") == "artifact_residual":
+        summary_bits.append(
+            f"edge={comp_meta.get('edge_mode', '?')}|p{comp_meta.get('edge_percentile', '?')}|k{comp_meta.get('top_hat_kernel_size', comp_meta.get('tophat_kernel_size', '?'))}"
+        )
+    if summary_bits:
+        st += "  |  " + " | ".join(summary_bits)
+    fig.suptitle(st, fontsize=10)
     fig.tight_layout()
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+    # Extended artifact_residual diagnostics (separate file; does not change other comparators' outputs).
+    if comp_meta.get("method") == "artifact_residual":
+        dbg_path = out.parent / f"{pair_id}_artifact_residual_debug.png"
+        try:
+            save_artifact_residual_diagnostic_figure(
+                pair_id=pair_id,
+                artifacts=artifacts,
+                comparator=comparator,
+                comparator_cfg=comparator_cfg,
+                output_path=dbg_path,
+            )
+        except Exception as exc:
+            print(f"[artifact_residual_debug] pair_id={pair_id} status=SKIPPED reason={exc}")
 
 
 def save_stage_visualizations(artifacts: PipelineArtifacts, pair_id: str, output_dir: str | Path) -> None:

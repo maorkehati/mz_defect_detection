@@ -142,6 +142,14 @@ def plot_detection_result(
     binary_final = artifacts.binary_mask_final if artifacts.binary_mask_final is not None else result.defect_mask
     threshold_map = artifacts.threshold_map
 
+    if suptitle is None:
+        cm = getattr(artifacts, "comparison_metadata", None) or {}
+        m = cm.get("method")
+        if m:
+            suptitle = f"Detection Result: {result.pair_id} | comparator={m}"
+        else:
+            suptitle = f"Detection Result: {result.pair_id}"
+
     fig = plot_prediction_panels(
         inspected_image=inspected,
         reference_image=reference,
@@ -150,7 +158,7 @@ def plot_detection_result(
         threshold_map=threshold_map,
         binary_mask_raw=binary_raw,
         figsize=figsize,
-        suptitle=suptitle or f"Detection Result: {result.pair_id}",
+        suptitle=suptitle,
         show=False,
     )
 

@@ -164,6 +164,30 @@ class GradientDifferenceComparatorConfig:
 
 
 @dataclass
+class ArtifactResidualComparatorConfig:
+    enabled: bool = True
+    params: Dict[str, Any] = field(default_factory=lambda: {
+        "pre_blur_sigma": 1.0,
+        # Prefer top_hat_kernel_size; tophat_kernel_size kept as alias for older configs.
+        "top_hat_kernel_size": 9,
+        "top_hat_iterations": 1,
+        "combine_mode": "max",
+        "norm_percentile_low": 1.0,
+        "norm_percentile_high": 99.0,
+        "use_valid_mask": True,
+        "edge_mode": "hard",
+        "edge_percentile": 90.0,
+        "edge_dilate_kernel": 5,
+        "edge_dilate_iterations": 1,
+        "edge_weight_on_edges": 0.25,
+        "edge_gradient_ksize": 3,
+        "edge_source": "inspected",
+        "min_valid_fraction": 0.0,
+        "debug_save_intermediates": True,
+    })
+
+
+@dataclass
 class ThresholdingConfig:
     enabled: bool = True
     params: Dict[str, Any] = field(default_factory=lambda: {
@@ -218,8 +242,12 @@ class ContourFilterPostprocessConfig:
         "top_k_keep": None,
         # integrated_anomaly | intensity_size_balanced | intensity_peak_balanced | local_contrast_balanced | artifact_consistent_local_contrast
         "ranking_mode": "integrated_anomaly",
-        # Signed-residual consistency filter: reject contours with mixed-sign residuals below threshold (None = disabled).
+        # Signed-residual consistency: computed for audit/ranking. Hard rejection requires both
+        # ``reject_on_low_sign_consistency`` True and ``min_sign_consistency`` set (see contour_filter_postprocess).
         "min_sign_consistency": None,
+        # If True and ``min_sign_consistency`` is set, drop candidates below the threshold (hard gate).
+        # Default False: never hard-reject on sign (ranking modes may still use sign softly).
+        "reject_on_low_sign_consistency": False,
         # Background ring half-width for local_contrast_balanced (dilate radius in px; 0 = skip ring).
         "ring_radius_px": 0,
         # Contour-level gate on ranking_score (None = disabled). Applied before top_k_keep cap.
@@ -268,6 +296,7 @@ class PipelineConfig:
     comparison: ComparisonConfig = field(default_factory=ComparisonConfig)
     ssim_comparator: SsimComparatorConfig = field(default_factory=SsimComparatorConfig)
     gradient_difference: GradientDifferenceComparatorConfig = field(default_factory=GradientDifferenceComparatorConfig)
+    artifact_residual: ArtifactResidualComparatorConfig = field(default_factory=ArtifactResidualComparatorConfig)
     thresholding: ThresholdingConfig = field(default_factory=ThresholdingConfig)
     otsu_threshold: OtsuThresholdConfig = field(default_factory=OtsuThresholdConfig)
     fixed_threshold: FixedThresholdConfig = field(default_factory=FixedThresholdConfig)
@@ -560,7 +589,8 @@ def build_search_euclidean_gradient_difference_mad_config() -> PipelineConfig:
     cfg.contour_filter_postprocess.params["border_margin_px"] = 3
     cfg.contour_filter_postprocess.params["top_k_keep"] = 5
     cfg.contour_filter_postprocess.params["ranking_mode"] = "artifact_consistent_local_contrast"
-    cfg.contour_filter_postprocess.params["min_sign_consistency"] = 0.70
+    # No hard sign-consistency threshold; sign is soft modifier in ranking only.
+    cfg.contour_filter_postprocess.params["min_sign_consistency"] = None
     cfg.contour_filter_postprocess.params["ring_radius_px"] = 7
     cfg.contour_filter_postprocess.params["morph_open_kernel"] = 3
     cfg.contour_filter_postprocess.params["morph_open_iterations"] = 1
@@ -576,4 +606,95 @@ def build_search_euclidean_gradient_difference_edge_suppressed_mad_config() -> P
     cfg.gradient_difference.params["edge_suppression_enabled"] = True
     cfg.gradient_difference.params["edge_percentile"] = 85.0
     cfg.gradient_difference.params["edge_weight_on_edges"] = 0.35
+    return cfg
+
+
+def build_search_euclidean_artifact_residual_mad_config() -> PipelineConfig:
+    """
+    Primary focused path for defect detection using **artifact_residual** (signed residual + white top-hat).
+
+    Pipeline: ``gaussian_preprocess`` → ``search_euclidean`` → ``linear_gain_offset``
+    → ``artifact_residual`` → ``mad_threshold`` → ``contour_filter_postprocess``.
+
+    This builder is **standalone** (not derived from the gradient-difference MAD path) so
+    comparator-specific defaults stay clean. The gradient-difference MAD configuration remains
+    :func:`build_search_euclidean_gradient_difference_mad_config`.
+
+    Defaults favor a conservative first run (higher ``k_mad``, simpler contour ranking, **no**
+    hard sign-consistency rejection: ``min_sign_consistency`` is ``None`` and
+    ``reject_on_low_sign_consistency`` is ``False``).
+
+    ``debug_save_intermediates`` is **True** so the first comparator pass populates
+    ``PipelineArtifacts.artifact_residual_intermediates`` for diagnostics and avoids an extra
+    comparator run when saving ``*_artifact_residual_debug.png`` (see ``visualization.debug``).
+    """
+    cfg = build_default_config()
+    cfg.choices.preprocessing = "gaussian_preprocess"
+    cfg.choices.alignment = "search_euclidean"
+    cfg.choices.normalization = "linear_gain_offset"
+    cfg.choices.comparison = "artifact_residual"
+    cfg.choices.thresholding = "mad_threshold"
+    cfg.choices.postprocessing = "contour_filter_postprocess"
+
+    # Same search-Euclidean alignment grid as other focused ``search_euclidean_*`` builders.
+    cfg.search_euclidean_alignment.params["coarse_angle_min"] = -4.0
+    cfg.search_euclidean_alignment.params["coarse_angle_max"] = 4.0
+    cfg.search_euclidean_alignment.params["coarse_steps"] = 17
+    cfg.search_euclidean_alignment.params["refine_half_width"] = 0.75
+    cfg.search_euclidean_alignment.params["refine_steps"] = 15
+    cfg.search_euclidean_alignment.params["overlap_threshold"] = 0.92
+    cfg.search_euclidean_alignment.params["upsample_factor"] = 20
+
+    cfg.artifact_residual.params.update(
+        {
+            "pre_blur_sigma": 1.0,
+            "top_hat_kernel_size": 9,
+            "top_hat_iterations": 1,
+            "combine_mode": "max",
+            "norm_percentile_low": 1.0,
+            "norm_percentile_high": 99.0,
+            "use_valid_mask": True,
+            "edge_mode": "hard",
+            "edge_percentile": 90.0,
+            "edge_dilate_kernel": 5,
+            "edge_dilate_iterations": 1,
+            "edge_weight_on_edges": 0.25,
+            "edge_gradient_ksize": 3,
+            "edge_source": "inspected",
+            "min_valid_fraction": 0.0,
+            # Populate intermediates on the main run so diagnostic PNGs need no extra comparator pass.
+            "debug_save_intermediates": True,
+        }
+    )
+
+    # Slightly conservative MAD vs. the gradient path (k=4): fewer false positives on first run.
+    cfg.thresholding.params["k_mad"] = 5.0
+    cfg.thresholding.params["min_threshold"] = 0.0
+    cfg.thresholding.params["use_valid_mask"] = True
+    cfg.thresholding.params["use_core_mask"] = True
+    cfg.thresholding.params["core_erode_iterations"] = 1
+
+    # Simpler postprocessing: speckle/border/geometry filters + anomaly-centric ranking; no sign hard gate.
+    cfg.contour_filter_postprocess.params.update(
+        {
+            "min_area": 8.0,
+            "max_area": 12000.0,
+            "max_aspect_ratio": 8.0,
+            "min_fill_ratio": 0.12,
+            "exclude_border_touching": True,
+            "border_margin_px": 3,
+            "top_k_keep": 6,
+            "ranking_mode": "intensity_size_balanced",
+            "min_sign_consistency": None,
+            "reject_on_low_sign_consistency": False,
+            "ring_radius_px": 0,
+            "min_contour_score": None,
+            "contour_score_threshold_mode": "absolute",
+            "morph_open_kernel": 3,
+            "morph_open_iterations": 1,
+            "morph_close_kernel": 3,
+            "morph_close_iterations": 1,
+        }
+    )
+
     return cfg

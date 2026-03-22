@@ -187,6 +187,12 @@ def _build_gradient_difference():
     return GradientDifferenceComparator()
 
 
+def _build_artifact_residual():
+    from modules.comparison.artifact_residual import ArtifactResidualComparator
+
+    return ArtifactResidualComparator()
+
+
 def _build_mad_threshold():
     from modules.thresholding.mad_threshold import MadThresholding
 
@@ -232,6 +238,7 @@ COMPARATOR_REGISTRY = {
     "absolute_difference": _build_absolute_difference,
     "ssim_comparator": _build_ssim_comparator,
     "gradient_difference": _build_gradient_difference,
+    "artifact_residual": _build_artifact_residual,
 }
 THRESHOLDING_REGISTRY = {
     "mad_threshold": _build_mad_threshold,

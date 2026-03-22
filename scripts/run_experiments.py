@@ -1,3 +1,12 @@
+"""
+Batch runner for multiple experiments in ``configs/experiment_matrix.py``.
+
+For a **single** standard run of the primary artifact_residual pipeline on all pairs, prefer::
+
+    python scripts/run_pipeline.py
+
+See that script for ``--config`` / dataset flags.
+"""
 from __future__ import annotations
 
 from datetime import datetime

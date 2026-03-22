@@ -88,6 +88,98 @@ def _p95_anomaly_inside_contour(
     return p
 
 
+def _centroid_from_contour(cnt: np.ndarray) -> Tuple[float, float]:
+    M = cv2.moments(cnt)
+    if float(M.get("m00", 0.0)) > 1e-6:
+        return float(M["m10"] / M["m00"]), float(M["m01"] / M["m00"])
+    x, y, w, h = cv2.boundingRect(cnt)
+    return float(x) + 0.5 * float(w), float(y) + 0.5 * float(h)
+
+
+def _build_gt_audit_rows(
+    gt_points: List[Tuple[int, int]],
+    geom_records: List[Dict[str, Any]],
+    mask_before: np.ndarray,
+    mask_after: np.ndarray,
+) -> List[Dict[str, Any]]:
+    """
+    For each GT pixel, find nearest geometric candidate (by centroid distance) and summarize fate.
+    geom_records must include candidate_id, cnt, centroid_*, bbox, sign_passed, ranking_score, reject_reason, kept_final, status_code.
+    """
+    if not gt_points:
+        return []
+    mb = np.asarray(mask_before).astype(bool)
+    ma = np.asarray(mask_after).astype(bool)
+    hh, ww = int(mb.shape[0]), int(mb.shape[1])
+    rows: List[Dict[str, Any]] = []
+    for di, (gx, gy) in enumerate(gt_points, start=1):
+        gxi, gyi = int(gx), int(gy)
+        on_raw = bool(0 <= gyi < hh and 0 <= gxi < ww and mb[gyi, gxi])
+        on_morph = bool(0 <= gyi < ma.shape[0] and 0 <= gxi < ma.shape[1] and ma[gyi, gxi])
+
+        if not geom_records:
+            rows.append({
+                "defect_id": di,
+                "gt_x": gxi,
+                "gt_y": gyi,
+                "nearest_candidate_id": None,
+                "distance_px": None,
+                "inside_contour": False,
+                "inside_bbox": False,
+                "gt_on_threshold_mask_raw": on_raw,
+                "gt_on_mask_after_morph": on_morph,
+                "candidate_area": None,
+                "candidate_score": None,
+                "sign_consistency": None,
+                "reject_reason": "",
+                "kept_final": False,
+                "status": "no_candidate",
+            })
+            continue
+
+        best: Optional[Dict[str, Any]] = None
+        best_d = float("inf")
+        for g in geom_records:
+            cx = float(g["centroid_x"])
+            cy = float(g["centroid_y"])
+            d = math.hypot(float(gxi) - cx, float(gyi) - cy)
+            if d < best_d:
+                best_d = d
+                best = g
+        assert best is not None
+        cnt = best["cnt"]
+        dist_pp = cv2.pointPolygonTest(np.asarray(cnt, dtype=np.float32), (float(gxi), float(gyi)), True)
+        inside_c = bool(dist_pp >= 0.0)
+        bx, by, bw, bh = int(best["x"]), int(best["y"]), int(best["w"]), int(best["h"])
+        inside_bb = bool(bx <= gxi < bx + bw and by <= gyi < by + bh)
+        sc = float(best["sign_consistency"]) if best.get("sign_consistency") is not None else None
+        rs = best.get("ranking_score")
+        rs_f = float(rs) if rs is not None and math.isfinite(float(rs)) else None
+        st = str(best.get("status_code", "unknown"))
+        rr = str(best.get("reject_reason", ""))
+        kf = bool(best.get("kept_final", False))
+        cid = int(best["candidate_id"])
+
+        rows.append({
+            "defect_id": di,
+            "gt_x": gxi,
+            "gt_y": gyi,
+            "nearest_candidate_id": cid,
+            "distance_px": float(best_d),
+            "inside_contour": inside_c,
+            "inside_bbox": inside_bb,
+            "gt_on_threshold_mask_raw": on_raw,
+            "gt_on_mask_after_morph": on_morph,
+            "candidate_area": float(best.get("area", 0.0)),
+            "candidate_score": rs_f,
+            "sign_consistency": sc,
+            "reject_reason": rr,
+            "kept_final": kf,
+            "status": st,
+        })
+    return rows
+
+
 def _compute_sign_consistency(
     signed_residual: np.ndarray,
     inside: np.ndarray,
@@ -96,7 +188,8 @@ def _compute_sign_consistency(
     Compute signed-residual statistics inside the contour.
     Returns (positive_sum, negative_sum, positive_mean, negative_mean, sign_consistency, dominant_sign).
     sign_consistency = max(pos_sum, neg_sum) / (pos_sum + neg_sum + eps); 1.0 = perfectly one-sign.
-    dominant_sign: "positive" if pos_sum >= neg_sum else "negative".
+    dominant_sign: "positive" | "negative" | "mixed" | "neutral".
+    neutral = no signed data; mixed = bipolar (low sign_consistency).
     """
     rvals = np.asarray(signed_residual[inside], dtype=np.float64).ravel()
     if rvals.size == 0:
@@ -110,7 +203,10 @@ def _compute_sign_consistency(
     eps = 1e-12
     total = pos_sum + neg_sum + eps
     sign_consistency = float(max(pos_sum, neg_sum) / total)
-    dominant_sign = "positive" if pos_sum >= neg_sum else "negative"
+    if sign_consistency < 0.55:
+        dominant_sign = "mixed"
+    else:
+        dominant_sign = "positive" if pos_sum >= neg_sum else "negative"
     return pos_sum, neg_sum, pos_mean, neg_mean, sign_consistency, dominant_sign
 
 
@@ -169,12 +265,13 @@ def compute_ranking_score(
     - intensity_size_balanced: p95 * sqrt(area); ring unused
     - intensity_peak_balanced: max * sqrt(area); ring unused
     - local_contrast_balanced: max(0, p95_inside - ring_mean) * sqrt(area); local contrast over size
-    - artifact_consistent_local_contrast: local_contrast * sqrt(area) * sign_consistency; favors one-sign artifacts
+    - artifact_consistent_local_contrast: local_contrast * sqrt(area) * (0.5 + 0.5 * sign_consistency);
+      soft modifier: higher sign consistency helps, moderate does not kill.
 
     If ``p95_anomaly`` is omitted, intensity modes use ``max_anomaly`` as fallback.
     For ``local_contrast_balanced``, if ``ring_mean_anomaly`` is missing/non-finite, uses ``mean_anomaly``
     (zero local contrast vs interior mean).
-    For ``artifact_consistent_local_contrast``, sign_consistency is required; if None, treated as 1.0.
+    For ``artifact_consistent_local_contrast``, sign_consistency if None treated as 1.0 (no penalty).
     """
     a = float(max(area, 0.0))
     sqrt_a = float(np.sqrt(a))
@@ -203,7 +300,9 @@ def compute_ranking_score(
         local_contrast = max(0.0, float(p95) - rm)
         sc = float(sign_consistency) if sign_consistency is not None else 1.0
         sc = max(0.0, min(1.0, sc))
-        return float(local_contrast * sqrt_a * sc)
+        # Soft modifier: 0.5 + 0.5*sc in [0.5, 1.0]; moderate sign consistency does not kill.
+        soft_sign = 0.5 + 0.5 * sc
+        return float(local_contrast * sqrt_a * soft_sign)
     raise ValueError(f"Unknown ranking_mode: {mode!r}")
 
 
@@ -315,6 +414,16 @@ class ContourFilterPostprocessor(PostprocessorBase):
             except (TypeError, ValueError):
                 min_sign_consistency_f = None
 
+        # Hard reject on low sign consistency only when both are set/enabled (default: off).
+        reject_on_low_sign_consistency = bool(
+            self.get_param(cfg, "reject_on_low_sign_consistency", False)
+        )
+        sign_hard_gate_enabled = bool(
+            reject_on_low_sign_consistency
+            and min_sign_consistency_f is not None
+            and float(min_sign_consistency_f) > 0.0
+        )
+
         morph_open_kernel = int(self.get_param(cfg, "morph_open_kernel", 0))
         morph_open_iterations = int(self.get_param(cfg, "morph_open_iterations", 0))
         morph_close_kernel = int(self.get_param(cfg, "morph_close_kernel", 0))
@@ -366,6 +475,7 @@ class ContourFilterPostprocessor(PostprocessorBase):
             if sres.shape != anom.shape:
                 sres = None
         scored: List[Dict[str, Any]] = []
+        geom_records: List[Dict[str, Any]] = []
         _candidate_id = 0
         for cnt in geo_ok:
             c_area = float(cv2.contourArea(cnt))
@@ -376,16 +486,31 @@ class ContourFilterPostprocessor(PostprocessorBase):
             inside = mask_c > 0
             if not np.any(inside):
                 continue
+            cx_i, cy_i = _centroid_from_contour(cnt)
+            bx, by, bw, bh = cv2.boundingRect(cnt)
             if sres is not None:
                 pos_sum, neg_sum, pos_mean, neg_mean, sign_consistency, dominant_sign = _compute_sign_consistency(
                     sres, inside
                 )
             else:
+                # No signed_residual: neutral = no sign data; 1.0 = no penalty in ranking.
                 sign_consistency, dominant_sign = 1.0, "neutral"
                 pos_sum, neg_sum, pos_mean, neg_mean = 0.0, 0.0, 0.0, 0.0
-            if min_sign_consistency_f is not None and sign_consistency < min_sign_consistency_f:
-                reject_counts["sign_consistency"] += 1
-                continue
+            _candidate_id += 1
+            cid = int(_candidate_id)
+            geom_base: Dict[str, Any] = {
+                "candidate_id": cid,
+                "cnt": cnt,
+                "centroid_x": float(cx_i),
+                "centroid_y": float(cy_i),
+                "x": int(bx),
+                "y": int(by),
+                "w": int(bw),
+                "h": int(bh),
+                "area": float(c_area),
+                "sign_consistency": float(sign_consistency),
+                "dominant_sign": dominant_sign,
+            }
             vals = anom[inside]
             mean_a = float(np.mean(vals))
             max_a = float(np.max(vals))
@@ -409,15 +534,20 @@ class ContourFilterPostprocessor(PostprocessorBase):
                 ring_mean_anomaly=rm_for_score,
                 sign_consistency=sign_consistency,
             )
-            x, y, w, h = cv2.boundingRect(cnt)
-            wh = float(w) / float(h) if h else 0.0
-            hw = float(h) / float(w) if w else 0.0
+            wh = float(bw) / float(bh) if bh else 0.0
+            hw = float(bh) / float(bw) if bw else 0.0
             aspect = max(wh, hw)
-            bbox_area = float(max(1, w * h))
+            bbox_area = float(max(1, bw * bh))
             fill_ratio = float(c_area / bbox_area)
-            _candidate_id += 1
-            scored.append({
-                "candidate_id": int(_candidate_id),
+
+            sign_passed = True
+            if sign_hard_gate_enabled and sres is not None:
+                if float(sign_consistency) < float(min_sign_consistency_f):
+                    sign_passed = False
+                    reject_counts["sign_consistency"] += 1
+
+            row = {
+                "candidate_id": cid,
                 "cnt": cnt,
                 "area": float(c_area),
                 "mean_anomaly": mean_a,
@@ -426,13 +556,27 @@ class ContourFilterPostprocessor(PostprocessorBase):
                 "ring_mean_anomaly": float(rm) if math.isfinite(rm) else float(mean_a),
                 "ring_p95_anomaly": float(rp) if math.isfinite(rp) else float(mean_a),
                 "ranking_score": float(score),
-                "x": int(x),
-                "y": int(y),
-                "w": int(w),
-                "h": int(h),
+                "sign_consistency": float(sign_consistency),
+                "dominant_sign": dominant_sign,
+                "positive_sum": float(pos_sum),
+                "negative_sum": float(neg_sum),
+                "positive_mean": float(pos_mean),
+                "negative_mean": float(neg_mean),
+                "x": int(bx),
+                "y": int(by),
+                "w": int(bw),
+                "h": int(bh),
                 "aspect_ratio": float(aspect),
                 "fill_ratio": float(fill_ratio),
-            })
+            }
+            geom_base["sign_passed"] = bool(sign_passed)
+            geom_base["ranking_score"] = float(score)
+            geom_base["mean_anomaly"] = float(mean_a)
+            geom_base["p95_anomaly"] = float(p95_a)
+            geom_records.append(geom_base)
+
+            if sign_passed:
+                scored.append(row)
 
         scored.sort(key=lambda d: d["ranking_score"], reverse=True)
         num_contours_after_geom_filters = int(len(geo_ok))
@@ -465,19 +609,85 @@ class ContourFilterPostprocessor(PostprocessorBase):
         after_threshold_ids = {int(d["candidate_id"]) for d in after_threshold}
         selected_ids = {int(d["candidate_id"]) for d in selected}
 
+        for g in geom_records:
+            if not g.get("sign_passed", False):
+                g["reject_reason"] = "sign_consistency"
+                g["kept_final"] = False
+                g["status_code"] = "rejected_sign"
+                continue
+            cid_g = int(g["candidate_id"])
+            if cid_g not in after_threshold_ids:
+                g["reject_reason"] = "score_threshold"
+                g["kept_final"] = False
+                g["status_code"] = "rejected_score"
+            elif cid_g not in selected_ids:
+                g["reject_reason"] = "top_k_cap"
+                g["kept_final"] = False
+                g["status_code"] = "dropped_topk"
+            else:
+                g["reject_reason"] = ""
+                g["kept_final"] = True
+                g["status_code"] = "kept"
+
+        gt_audit_rows: List[Dict[str, Any]] = []
+        gt_raw = self.get_param(cfg, "gt_points", None)
+        if gt_raw:
+            gt_list: List[Tuple[int, int]] = []
+            try:
+                for p in gt_raw:
+                    if isinstance(p, (tuple, list)) and len(p) >= 2:
+                        gt_list.append((int(p[0]), int(p[1])))
+            except (TypeError, ValueError):
+                gt_list = []
+            if gt_list:
+                gt_audit_rows = _build_gt_audit_rows(
+                    gt_list,
+                    geom_records,
+                    np.asarray(binary_mask_raw).astype(bool),
+                    np.asarray(mask_u8 > 0, dtype=bool),
+                )
+
         contour_audit_rows: List[Dict[str, Any]] = []
         contour_audit_specs: List[Dict[str, Any]] = []
+        # Sign gate (optional): candidates failing hard sign-consistency never enter ``scored``.
+        for g in geom_records:
+            if g.get("sign_passed", True):
+                continue
+            cid = int(g["candidate_id"])
+            cnt = g["cnt"]
+            contour_audit_rows.append({
+                "candidate_id": cid,
+                "area": float(g.get("area", 0.0)),
+                "ranking_score": float(g.get("ranking_score", 0.0)),
+                "mean_inside": float(g.get("mean_anomaly", 0.0)),
+                "p95_inside": float(g.get("p95_anomaly", 0.0)),
+                "ring_mean": float(g.get("mean_anomaly", 0.0)),
+                "sign_consistency": float(g.get("sign_consistency", 1.0)),
+                "dominant_sign": str(g.get("dominant_sign", "neutral")),
+                "kept_final": False,
+                "reject_reason": "sign_consistency",
+                "reject_stage": "sign_gate",
+            })
+            contour_audit_specs.append({
+                "candidate_id": cid,
+                "cnt": cnt,
+                "status": "rejected_sign_gate",
+            })
+
         for d in scored:
             cid = int(d["candidate_id"])
             if cid not in after_threshold_ids:
-                st = "score_threshold"
+                st = "rejected_score"
                 rr = "score_threshold"
+                rstage = "score_threshold"
             elif cid not in selected_ids:
-                st = "top_k_cap"
+                st = "dropped_topk"
                 rr = "top_k_cap"
+                rstage = "top_k_cap"
             else:
                 st = "kept"
                 rr = ""
+                rstage = "kept"
             contour_audit_rows.append({
                 "candidate_id": cid,
                 "area": float(d["area"]),
@@ -489,12 +699,16 @@ class ContourFilterPostprocessor(PostprocessorBase):
                 "dominant_sign": d.get("dominant_sign", "neutral"),
                 "kept_final": bool(cid in selected_ids),
                 "reject_reason": rr,
+                "reject_stage": rstage,
             })
             contour_audit_specs.append({
                 "candidate_id": cid,
                 "cnt": d["cnt"],
                 "status": st,
             })
+
+        for g in geom_records:
+            g.pop("cnt", None)
 
         out = np.zeros_like(mask_u8, dtype=np.uint8)
         boxes: List[Dict[str, Any]] = []
@@ -579,11 +793,15 @@ class ContourFilterPostprocessor(PostprocessorBase):
             "top_sign_consistency_ranked": sign_consistency_ranked[:10],
             "top_dominant_sign_ranked": dominant_sign_ranked[:10],
             "min_sign_consistency": min_sign_consistency_f,
+            "reject_on_low_sign_consistency": bool(reject_on_low_sign_consistency),
+            "sign_hard_gate_enabled": bool(sign_hard_gate_enabled),
+            "num_rejected_sign_consistency_gate": int(reject_counts.get("sign_consistency", 0)),
             "total_kept_area": float(sum(areas_kept)),
             "num_centers_drawn": int(num_contours_after_topk),
             "components": boxes,
             "bounding_boxes": boxes,
             "contour_audit_rows": contour_audit_rows,
             "contour_audit_specs": contour_audit_specs,
+            "gt_audit_rows": gt_audit_rows,
         }
         return out.astype(bool), metadata
