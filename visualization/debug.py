@@ -2271,4 +2271,6 @@ def save_stage_visualizations(artifacts: PipelineArtifacts, pair_id: str, output
         )
         _save_contour_area_histogram(out / get_debug_filename("contour_area_histogram"), artifacts.decision_metadata)
         _save_contour_boxes_overlay(out / get_debug_filename("contour_boxes_overlay"), np.asarray(raw_ins), artifacts.decision_metadata)
+    elif post_method == "peak_nms_postprocess" and raw_ins is not None:
+        _save_contour_boxes_overlay(out / get_debug_filename("contour_boxes_overlay"), np.asarray(raw_ins), artifacts.decision_metadata)
 

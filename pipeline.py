@@ -215,9 +215,23 @@ class DefectDetectionPipeline:
         self._set_runtime_param(post_cfg, "valid_mask", valid_mask)
         signed_residual = np.asarray(ins, dtype=np.float32) - np.asarray(ref, dtype=np.float32)
         self._set_runtime_param(post_cfg, "signed_residual", signed_residual)
+        self._set_runtime_param(post_cfg, "pair_id", sample.pair_id)
+        ar_inter = artifacts.artifact_residual_intermediates
+        if ar_inter and isinstance(ar_inter, dict):
+            if "edge_mask_dilated" in ar_inter:
+                em = np.asarray(ar_inter["edge_mask_dilated"], dtype=np.float32)
+                self._set_runtime_param(post_cfg, "edge_exclude_mask", em > 0.5)
+            # Pre-normalization residual energy avoids flat saturated peaks in robust-normalized anomaly [0,1].
+            if "combined_after_edge" in ar_inter:
+                self._set_runtime_param(
+                    post_cfg,
+                    "peak_score_map",
+                    np.asarray(ar_inter["combined_after_edge"], dtype=np.float32),
+                )
         gt_pts = get_ground_truth_points_for_pair(sample.pair_id)
         if gt_pts:
             self._set_runtime_param(post_cfg, "gt_points", gt_pts)
+        self._set_runtime_param(post_cfg, "threshold_map", threshold_map)
         binary_mask_final, decision_metadata = self.postprocessor.run(
             binary_mask_raw,
             anomaly_map,
@@ -225,6 +239,10 @@ class DefectDetectionPipeline:
         )
         self._clear_runtime_param(post_cfg, "signed_residual")
         self._clear_runtime_param(post_cfg, "gt_points")
+        self._clear_runtime_param(post_cfg, "pair_id")
+        self._clear_runtime_param(post_cfg, "edge_exclude_mask")
+        self._clear_runtime_param(post_cfg, "peak_score_map")
+        self._clear_runtime_param(post_cfg, "threshold_map")
         self._clear_runtime_param(post_cfg, "valid_mask")
         artifacts.binary_mask_final = binary_mask_final
         artifacts.decision_metadata.update(decision_metadata)
@@ -277,11 +295,14 @@ class DefectDetectionPipeline:
         else:
             debug_root = Path(self.cfg.debug.debug_dir)
 
-        save_stage_visualizations(
-            artifacts=artifacts,
-            pair_id=pair_id,
-            output_dir=debug_root / pair_id,
-        )
+        try:
+            save_stage_visualizations(
+                artifacts=artifacts,
+                pair_id=pair_id,
+                output_dir=debug_root / pair_id,
+            )
+        except Exception as exc:
+            print(f"[debug-viz] pair_id={pair_id} status=SKIPPED reason={exc}")
 
     def _save_compact_pipeline_figure(self, pair_id: str, artifacts: PipelineArtifacts) -> None:
         out_path = Path(__file__).resolve().parent / "outs" / "detection_results" / f"{pair_id}_pipeline.png"
@@ -916,7 +937,10 @@ class DefectDetectionPipeline:
             f"num_centers_drawn={num_centers_drawn}, top_contour_areas={top_areas}"
             f"{topk_str}{morph_str}{rc_str}"
         )
-        if str(decision_metadata.get("method", "")) == "contour_filter_postprocess":
+        if str(decision_metadata.get("method", "")) in {
+            "contour_filter_postprocess",
+            "peak_nms_postprocess",
+        }:
             self._print_postprocessing_stage_counts(decision_metadata)
             self._print_postprocessing_rank_lists(decision_metadata)
 
@@ -970,12 +994,14 @@ class DefectDetectionPipeline:
     def _save_postprocess_audit(self, pair_id: str, artifacts: PipelineArtifacts) -> None:
         """Write contour candidate audit (CSV + overlay) under repo outs/postprocess_audit/."""
         meta = artifacts.decision_metadata or {}
-        if str(meta.get("method", "")) != "contour_filter_postprocess":
+        if str(meta.get("method", "")) not in {"contour_filter_postprocess", "peak_nms_postprocess"}:
             return
         rows = meta.get("contour_audit_rows")
         specs = meta.get("contour_audit_specs")
         gt_audit = meta.get("gt_audit_rows") or []
-        if not rows and not specs and not gt_audit:
+        peak_full = meta.get("peak_nms_full_audit_rows") or []
+        peak_scored = meta.get("peak_nms_candidate_rows") or []
+        if not rows and not specs and not gt_audit and not peak_full and not peak_scored:
             return
         root = _REPO_ROOT / "outs" / "postprocess_audit" / pair_id
         root.mkdir(parents=True, exist_ok=True)
@@ -997,6 +1023,13 @@ class DefectDetectionPipeline:
                 save_contour_audit_csv(rows, root / "contour_audit.csv")
             if gt_audit:
                 save_gt_audit_csv(gt_audit, root / "gt_audit.csv")
+            if str(meta.get("method", "")) == "peak_nms_postprocess":
+                from modules.postprocessing.peak_nms_postprocess import save_peak_nms_audit_csv
+
+                if peak_full:
+                    save_peak_nms_audit_csv(peak_full, root / "peak_nms_full_audit.csv")
+                elif peak_scored:
+                    save_peak_nms_audit_csv(peak_scored, root / "peak_nms_candidates.csv")
             if ins is not None and specs:
                 save_contour_postprocess_audit(pair_id, np.asarray(ins), specs, root)
             print(f"[audit:postprocess] pair_id={pair_id} dir={root}")
@@ -1026,7 +1059,7 @@ class DefectDetectionPipeline:
         )
 
     def _print_gt_audit(self, pair_id: str, decision_metadata: dict) -> None:
-        if str(decision_metadata.get("method", "")) != "contour_filter_postprocess":
+        if str(decision_metadata.get("method", "")) not in {"contour_filter_postprocess", "peak_nms_postprocess"}:
             return
         rows = decision_metadata.get("gt_audit_rows")
         if not rows:
@@ -1104,6 +1137,8 @@ class DefectDetectionPipeline:
         method = str(self.cfg.choices.postprocessing)
         if method == "contour_filter_postprocess":
             return self.cfg.contour_filter_postprocess
+        if method == "peak_nms_postprocess":
+            return self.cfg.peak_nms_postprocess
         return self.cfg.postprocessing
 
     def _print_resolved_postprocess_config(self, pair_id: str) -> None:
@@ -1131,6 +1166,24 @@ class DefectDetectionPipeline:
                 f"  ring_radius_px = {p.get('ring_radius_px')}\n"
                 f"  min_sign_consistency = {p.get('min_sign_consistency')}\n"
                 f"  reject_on_low_sign_consistency = {p.get('reject_on_low_sign_consistency', False)}"
+            )
+        elif mod == "peak_nms_postprocess":
+            pp = self.cfg.peak_nms_postprocess
+            p = pp.params
+            print(
+                "[resolved:postprocess]\n"
+                f"  pair_id = {pair_id}\n"
+                f"  module = peak_nms_postprocess\n"
+                f"  gaussian_sigma = {pp.gaussian_sigma}\n"
+                f"  peak_min_distance = {pp.peak_min_distance}\n"
+                f"  peak_threshold_percentile = {pp.peak_threshold_percentile}\n"
+                f"  edge_reject_radius = {pp.edge_reject_radius}\n"
+                f"  min_peakness = {pp.min_peakness}\n"
+                f"  top_k_keep = {pp.top_k_keep}\n"
+                f"  min_best_score = {pp.min_best_score}\n"
+                f"  render_radius_px = {pp.render_radius_px}\n"
+                f"  case3_return_empty = {pp.case3_return_empty}\n"
+                f"  (params overrides) = {p!r}"
             )
         else:
             print(

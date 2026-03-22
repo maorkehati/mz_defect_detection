@@ -18,3 +18,10 @@ try:
     __all__.append("contour_keep_decision")
 except Exception:
     pass
+
+try:
+    from .peak_nms_postprocess import PeakNMSPostprocessor
+
+    __all__.append("PeakNMSPostprocessor")
+except Exception:
+    pass

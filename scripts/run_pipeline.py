@@ -1,6 +1,6 @@
 """Main repository entry point for running the full defect-detection pipeline.
 
-**Primary path (recommended):** artifact_residual comparator + search Euclidean + MAD + contours::
+**Primary path (recommended):** artifact_residual comparator + search Euclidean + MAD + peak NMS postprocess::
 
     python scripts/run_pipeline.py
     python scripts/run_pipeline.py --config search_euclidean_artifact_residual_mad
@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from config import (
     build_search_euclidean_artifact_residual_mad_config,
+    build_search_euclidean_artifact_residual_peak_nms_config,
     build_search_euclidean_gradient_difference_edge_suppressed_mad_config,
     build_search_euclidean_gradient_difference_mad_config,
     build_search_euclidean_gradient_difference_otsu_config,
@@ -106,6 +107,8 @@ def _build_selected_config(variant: str) -> tuple[str, object]:
         cfg = build_search_euclidean_gradient_difference_edge_suppressed_mad_config()
     elif variant == "search_euclidean_artifact_residual_mad":
         cfg = build_search_euclidean_artifact_residual_mad_config()
+    elif variant == "search_euclidean_artifact_residual_peak_nms":
+        cfg = build_search_euclidean_artifact_residual_peak_nms_config()
     else:
         raise ValueError(f"Unknown pipeline variant={variant!r}.")
 

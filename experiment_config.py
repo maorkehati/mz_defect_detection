@@ -1,9 +1,11 @@
 """
 Map experiment ``variant`` strings to :func:`config.build_*` factories.
 
-**Recommended primary variant:** ``search_euclidean_artifact_residual_mad`` (see
-:func:`config.build_search_euclidean_artifact_residual_mad_config`). For a direct CLI run on all
-pairs, use ``python scripts/run_pipeline.py`` instead of this module.
+**Recommended primary variant:** ``search_euclidean_artifact_residual_mad`` or
+``search_euclidean_artifact_residual_peak_nms`` (same pipeline; see
+:func:`config.build_search_euclidean_artifact_residual_mad_config` and
+:func:`config.build_search_euclidean_artifact_residual_peak_nms_config`). For a direct CLI run on
+all pairs, use ``python scripts/run_pipeline.py`` instead of this module.
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ from pprint import pformat
 
 from config import (
     build_search_euclidean_artifact_residual_mad_config,
+    build_search_euclidean_artifact_residual_peak_nms_config,
     build_search_euclidean_gradient_difference_edge_suppressed_mad_config,
     build_search_euclidean_gradient_difference_mad_config,
     build_search_euclidean_gradient_difference_otsu_config,
@@ -67,6 +70,8 @@ def build_pipeline_config_from_variant(variant: str):
         return build_search_euclidean_gradient_difference_edge_suppressed_mad_config()
     if v == "search_euclidean_artifact_residual_mad":
         return build_search_euclidean_artifact_residual_mad_config()
+    if v == "search_euclidean_artifact_residual_peak_nms":
+        return build_search_euclidean_artifact_residual_peak_nms_config()
     raise ValueError(
         f"Unknown variant '{variant}'. "
         "Expected one of: default, ssim, orb_ssim, orb_ssim_otsu, orb_ssim_fixed, "
@@ -77,7 +82,7 @@ def build_pipeline_config_from_variant(variant: str):
         "search_euclidean_gradient_difference_otsu, "
         "search_euclidean_gradient_difference_mad, "
         "search_euclidean_gradient_difference_edge_suppressed_mad, "
-        "search_euclidean_artifact_residual_mad."
+        "search_euclidean_artifact_residual_mad, search_euclidean_artifact_residual_peak_nms."
     )
 
 

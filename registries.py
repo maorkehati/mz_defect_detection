@@ -223,6 +223,12 @@ def _build_contour_filter_postprocess():
     return ContourFilterPostprocessor()
 
 
+def _build_peak_nms_postprocess():
+    from modules.postprocessing.peak_nms_postprocess import PeakNMSPostprocessor
+
+    return PeakNMSPostprocessor()
+
+
 PREPROCESSOR_REGISTRY = {"gaussian_preprocess": _build_gaussian_preprocess}
 ALIGNER_REGISTRY = {
     "translation_phase_correlation": _build_translation_phase_correlation,
@@ -248,6 +254,7 @@ THRESHOLDING_REGISTRY = {
 POSTPROCESSOR_REGISTRY = {
     "basic_morphology": _build_basic_morphology,
     "contour_filter_postprocess": _build_contour_filter_postprocess,
+    "peak_nms_postprocess": _build_peak_nms_postprocess,
 }
 
 __all__ = [
